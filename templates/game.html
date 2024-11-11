@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chess Game View</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="board-column">
+            <div class="navigation-bar">
+                <a href="/" class="back-button">← Back to Dashboard</a>
+                <div class="game-info">
+                    <span class="status-badge {{ game.status }}">{{ game.status }}</span>
+                    <span class="game-id">#{{ game.game_id }}</span>
+                </div>
+            </div>
+            
+            <div class="game-header-panel">
+                <div class="player white">
+                    <span class="model-name">WHITE: {{ game.white_model.split('/')[-1] }}</span>
+                    <span class="full-name">{{ game.white_model }}</span>
+                </div>
+                <div class="vs">VS</div>
+                <div class="player black">
+                    <span class="model-name">BLACK: {{ game.black_model.split('/')[-1] }}</span>
+                    <span class="full-name">{{ game.black_model }}</span>
+                </div>
+            </div>
+    
+            <div class="board-container">
+                <div id="chessboard"></div>
+            </div>
+    
+            <div class="evaluation-chart">
+                <canvas id="evalChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="info-column">
+            <div class="panel game-info">
+                <h3>Game Information</h3>
+                <div class="info-grid">
+                    <div class="info-item">
+                        <span class="label">Game ID:</span>
+                        <span class="value">#{{ game.game_id }}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Started:</span>
+                        <span class="value time-ago" data-time="{{ game.start_time }}">
+                            {{ game.start_time }}
+                        </span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Last Update:</span>
+                        <span class="value time-ago" id="lastUpdate" data-time="{{ game.last_update }}">
+                            {{ game.last_update }}
+                        </span>
+                    </div>
+                    <div class="info-item">
+                        <span class="label">Move Count:</span>
+                        <span class="value" id="moveCount">0</span>
+                    </div>
+                </div>
+            </div>
+    
+            <div class="panel move-history">
+                <h3>Move History</h3>
+                <div id="moveHistory" class="moves-container"></div>
+            </div>
+    
+            <div class="panel analysis">
+                <h3>Position Analysis</h3>
+                <div class="analysis-grid">
+                    <div class="analysis-item">
+                        <span class="label">Evaluation:</span>
+                        <span class="value" id="currentEval">0.0</span>
+                    </div>
+                    <div class="analysis-item">
+                        <span class="label">Best Line:</span>
+                        <span class="value" id="bestLine">-</span>
+                    </div>
+                    <div class="analysis-item">
+                        <span class="label">Last Move:</span>
+                        <span class="value" id="lastMove">-</span>
+                    </div>
+                    <div class="analysis-item">
+                        <span class="label">Classification:</span>
+                        <span class="value move-classification" id="moveClassification">-</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        let board = null;
+        let evalChart = null;
+        let isUpdating = false;
+        let currentFen = '';
+
+        function updateMoveHistory(moves) {
+            const container = document.getElementById('moveHistory');
+            let html = '';
+            
+            for (let i = 0; i < moves.length; i += 2) {
+                const moveNumber = Math.floor(i/2) + 1;
+                html += `<div class="move-row">`;
+                html += `<span class="move-number">${moveNumber}.</span>`;
+                html += `<span class="move white">${moves[i]}</span>`;
+                if (moves[i+1]) {
+                    html += `<span class="move black">${moves[i+1]}</span>`;
+                }
+                html += `</div>`;
+            }
+            
+            container.innerHTML = html;
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function updateMetadata(metadata) {
+            // Update status badge
+            const statusBadge = document.querySelector('.status-badge');
+            if (statusBadge) {
+                statusBadge.className = `status-badge ${metadata.status}`;
+                statusBadge.textContent = metadata.status;
+            }
+            
+            // Update move count
+            document.getElementById('moveCount').textContent = metadata.move_count;
+            
+            // Update timestamps
+            const elements = document.getElementsByClassName('time-ago');
+            Array.from(elements).forEach(el => {
+                if (el.dataset.time) {
+                    el.textContent = timeAgo(el.dataset.time);
+                }
+            });
+            
+            // Update game info if winner exists
+            if (metadata.winner) {
+                const gameInfo = document.querySelector('.game-info');
+                if (gameInfo) {
+                    const winnerDisplay = document.createElement('div');
+                    winnerDisplay.className = 'winner-display';
+                    winnerDisplay.textContent = `Winner: ${metadata.winner}`;
+                    gameInfo.appendChild(winnerDisplay);
+                }
+            }
+        }
+
+        function updateEvalChart(evaluations) {
+            if (!evalChart) {
+                initEvalChart();
+            }
+            
+            const labels = evaluations.map((_, index) => 
+                `${Math.floor(index/2) + 1}${index % 2 ? 'b' : 'w'}`
+            );
+            
+            evalChart.data.labels = labels;
+            evalChart.data.datasets[0].data = evaluations;
+            evalChart.update('none');
+        }
+
+        async function updateGameState() {
+            if (isUpdating) return;
+            
+            try {
+                isUpdating = true;
+                
+                const response = await fetch(`/api/game/${gameDir}/status`);
+                if (!response.ok) throw new Error('Failed to fetch game state');
+                const data = await response.json();
+                
+                if (data.error) {
+                    console.error('Error in game state:', data.error);
+                    return;
+                }
+
+                // Update board if position changed
+                if (data.state.current_fen !== currentFen) {
+                    currentFen = data.state.current_fen;
+                    if (!board) {
+                        board = Chessboard('chessboard', {
+                            position: currentFen,
+                            pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png',
+                            draggable: false
+                        });
+                    } else {
+                        board.position(currentFen, false);
+                    }
+                }
+                
+                // Update move history
+                updateMoveHistory(data.state.moves);
+                
+                // Update evaluation chart
+                if (data.metadata.evaluations?.length > 0) {
+                    updateEvalChart(data.metadata.evaluations);
+                    document.getElementById('currentEval').textContent = 
+                        data.metadata.evaluations[data.metadata.evaluations.length - 1].toFixed(2);
+                }
+                
+                // Update metadata displays
+                updateMetadata(data.metadata);
+                
+            } catch (error) {
+                console.error('Error updating game state:', error);
+            } finally {
+                isUpdating = false;
+                setTimeout(updateGameState, 1000);
+            }
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            initEvalChart();
+            updateGameState();
+            
+            // Handle window resize
+            window.addEventListener('resize', function() {
+                if (board) board.resize();
+            });
+        });
+</script>
+</body>
+</html>

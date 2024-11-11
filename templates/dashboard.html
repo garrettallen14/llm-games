@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chess Games Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+</head>
+<body>
+    <div class="dashboard-container">
+        <header class="dashboard-header">
+            <h1>Chess Games Dashboard</h1>
+            <div class="header-actions">
+                <span id="activeGames" class="stat-badge">Active Games: 0</span>
+                <button id="newGameBtn" class="primary-button">New Game</button>
+            </div>
+        </header>
+        
+        <div class="games-grid" id="gamesGrid">
+            {% for game_dir, game in games.items() %}
+                <div class="game-card" data-dir="{{ game_dir }}" data-status="{{ game.status }}">
+                    <div class="game-header">
+                        <h3>{{ game.white_model.split('/')[-1] }} vs {{ game.black_model.split('/')[-1] }}</h3>
+                        <div class="status-indicator">
+                            <span class="status-badge {{ game.status }}">{{ game.status }}</span>
+                            <span class="game-id">#{{ game.game_id }}</span>
+                        </div>
+                    </div>
+                    <div class="game-info">
+                        <div class="info-row">
+                            <span class="info-label">White:</span>
+                            <span class="info-value">{{ game.white_model }}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Black:</span>
+                            <span class="info-value">{{ game.black_model }}</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Started:</span>
+                            <span class="info-value time-ago" data-time="{{ game.start_time }}">
+                                {{ game.start_time }}
+                            </span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-label">Last Move:</span>
+                            <span class="info-value time-ago" data-time="{{ game.last_update }}">
+                                {{ game.last_update }}
+                            </span>
+                        </div>
+                    </div>
+                    <div class="game-actions">
+                        <a href="/game/{{ game_dir }}" class="button view-button">View Game</a>
+                        {% if game.status in ['initializing', 'active', 'paused'] %}
+                            <button class="control-button {{ 'active' if game.status == 'active' else '' }}"
+                                    data-dir="{{ game_dir }}" 
+                                    data-action="{{ 'stop' if game.status == 'active' else 'start' }}">
+                                    {{ 'Stop' if game.status == 'active' else 'Start' }}
+                                </button>
+                            {% endif %}
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+
+
+    <!-- New Game Modal -->
+    <div id="newGameModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Create New Game</h2>
+                <button class="close-button" id="closeModal">&times;</button>
+            </div>
+            <form id="newGameForm">
+                <div class="form-group">
+                    <label for="white_model">White Player:</label>
+                    <select name="white_model" id="white_model" required>
+                        <option value="google/gemini-flash-1.5-8b">Gemini Flash 1.5 8b</option>
+                        <option value="anthropic/claude-3-haiku">Claude 3 Haiku</option>
+                        <option value="anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet</option>
+                        <option value="google/gemini-pro">Gemini Pro</option>
+                        <option value="google/gemini-1.5-pro">Gemini 1.5 Pro</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="black_model">Black Player:</label>
+                    <select name="black_model" id="black_model" required>
+                        <option value="google/gemini-flash-1.5-8b">Gemini Flash 1.5 8b</option>
+                        <option value="anthropic/claude-3-haiku">Claude 3 Haiku</option>
+                        <option value="anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet</option>
+                        <option value="google/gemini-pro">Gemini Pro</option>
+                        <option value="google/gemini-1.5-pro">Gemini 1.5 Pro</option>
+                    </select>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="primary-button">Start Game</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+
+        async function loadModels() {
+            try {
+                const response = await fetch('/api/models');
+                const models = await response.json();
+                
+                const selects = ['white_model', 'black_model'];
+                selects.forEach(id => {
+                    const select = document.getElementById(id);
+                    select.innerHTML = models.map(model => 
+                        `<option value="${model.model_name}">${model.display_name}</option>`
+                    ).join('');
+                });
+            } catch (error) {
+                console.error('Error loading models:', error);
+            }
+        }
+
+        // Time ago formatter
+        function timeAgo(date) {
+            const seconds = Math.floor((new Date() - new Date(date)) / 1000);
+            let interval = Math.floor(seconds / 31536000);
+            
+            if (interval > 1) return interval + ' years ago';
+            interval = Math.floor(seconds / 2592000);
+            if (interval > 1) return interval + ' months ago';
+            interval = Math.floor(seconds / 86400);
+            if (interval > 1) return interval + ' days ago';
+            interval = Math.floor(seconds / 3600);
+            if (interval > 1) return interval + ' hours ago';
+            interval = Math.floor(seconds / 60);
+            if (interval > 1) return interval + ' minutes ago';
+            return Math.floor(seconds) + ' seconds ago';
+        }
+
+        function updateTimeAgos() {
+            document.querySelectorAll('.time-ago').forEach(el => {
+                el.textContent = timeAgo(el.dataset.time);
+            });
+        }
+
+        async function updateGames() {
+            try {
+                const response = await fetch('/api/games');
+                const games = await response.json();
+                
+                let activeCount = 0;
+                
+                // Update existing game cards
+                for (const [dir, game] of Object.entries(games)) {
+                    if (game.status === 'active') activeCount++;
+                    
+                    const card = document.querySelector(`.game-card[data-dir="${dir}"]`);
+                    if (card) {
+                        // Update status
+                        card.dataset.status = game.status;
+                        const statusBadge = card.querySelector('.status-badge');
+                        if (statusBadge) {
+                            statusBadge.className = `status-badge ${game.status}`;
+                            statusBadge.textContent = game.status;
+                        }
+                        
+                        // Update times
+                        const lastUpdate = card.querySelector('[data-time]');
+                        if (lastUpdate) {
+                            lastUpdate.dataset.time = game.last_update;
+                        }
+                        
+                        // Update control button
+                        const controlBtn = card.querySelector('.control-button');
+                        if (controlBtn) {
+                            if (game.status === 'active') {
+                                controlBtn.textContent = 'Stop';
+                                controlBtn.dataset.action = 'stop';
+                            } else {
+                                controlBtn.textContent = 'Start';
+                                controlBtn.dataset.action = 'start';
+                            }
+                        }
+                        
+                        // Update winner if game completed
+                        if (game.winner !== null) {
+                            const winner = game.winner === 0 ? 'White' : 
+                                         game.winner === 1 ? 'Black' : 'Draw';
+                            const winnerEl = card.querySelector('.winner');
+                            if (winnerEl) winnerEl.textContent = winner;
+                        }
+                    }
+                }
+                
+                // Update active games count
+                document.getElementById('activeGames').textContent = `Active Games: ${activeCount}`;
+                
+            } catch (error) {
+                console.error('Error updating games:', error);
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const modal = document.getElementById('newGameModal');
+            const newGameBtn = document.getElementById('newGameBtn');
+            const closeModal = document.getElementById('closeModal');
+            const newGameForm = document.getElementById('newGameForm');
+            loadModels();
+            
+            // Modal controls
+            newGameBtn.onclick = () => modal.style.display = 'block';
+            closeModal.onclick = () => modal.style.display = 'none';
+            window.onclick = (e) => {
+                if (e.target === modal) modal.style.display = 'none';
+            };
+            
+            // Game control buttons
+            document.addEventListener('click', async (e) => {
+                if (e.target.matches('.control-button')) {
+                    const button = e.target;
+                    const dir = button.dataset.dir;
+                    const action = button.dataset.action;
+                    
+                    try {
+                        const response = await fetch(`/api/game/${dir}/control`, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ action })
+                        });
+                        
+                        const data = await response.json();
+                        if (data.success) {
+                            // Update will happen via periodic refresh
+                            button.disabled = true;
+                            setTimeout(() => button.disabled = false, 2000);
+                        } else {
+                            alert(`Failed to ${action} game: ${data.error}`);
+                        }
+                    } catch (error) {
+                        console.error(`Error controlling game: ${error}`);
+                        alert(`Failed to ${action} game`);
+                    }
+                }
+            });
+            
+            // New game form
+            newGameForm.onsubmit = async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                
+                try {
+                    const response = await fetch('/api/create_game', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            white_model: formData.get('white_model'),
+                            black_model: formData.get('black_model')
+                        })
+                    });
+                    
+                    const data = await response.json();
+                    if (data.success) {
+                        modal.style.display = 'none';
+                        window.location.href = `/game/${data.game_dir}`;
+                    } else {
+                        alert(`Failed to create game: ${data.error}`);
+                    }
+                } catch (error) {
+                    console.error('Error creating game:', error);
+                    alert('Failed to create game');
+                }
+            };
+            
+            // Update times and game states periodically
+            setInterval(updateTimeAgos, 30000);
+            setInterval(updateGames, 5000);
+            updateTimeAgos();
+        });
+    </script>
+</body>
+</html>
