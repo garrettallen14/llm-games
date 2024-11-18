@@ -1,73 +1,75 @@
-# games/mafia/game.py
-
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional, List, Set, Tuple
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Any
+import random
+import re
+from collections import defaultdict
+import io
+import base64
 from datetime import datetime
 import numpy as np
-import re
-import base64
-from dataclasses import dataclass, field
 from PIL import Image, ImageDraw, ImageFont
-import io
-import random
 
 from base.llm_player import BaseLLMPlayer
 
+@dataclass
+class GameResult:
+    """Result of a game"""
+    status: str
+    winner: Optional[str]
+    metadata: Dict[str, Any]
+
 class GamePhase(Enum):
+    """Game phases"""
     SETUP = "setup"
     NIGHT = "night"
-    DAY_DISCUSSION = "day_discussion"
-    DAY_VOTING = "day_voting"
-    GAME_END = "game_end"
+    DAY = "day"
 
 class PlayerRole(Enum):
+    """Player roles"""
     VILLAGER = "villager"
     MAFIA = "mafia"
     DETECTIVE = "detective"
     DOCTOR = "doctor"
 
 @dataclass
-class PlayerState:
+class Player:
     """Tracks individual player state and information"""
     role: PlayerRole
     is_alive: bool = True
-    current_action: Optional[str] = None
-    action_history: List[str] = field(default_factory=list)
-    vote_history: List[int] = field(default_factory=list)
     night_action_used: bool = False
-    was_saved: bool = False
-    was_investigated: bool = False
-    known_roles: Dict[int, PlayerRole] = field(default_factory=dict)
-    suspicious_of: List[int] = field(default_factory=list)
-    received_votes: int = 0
     private_messages: List[str] = field(default_factory=list)
-    team_messages: List[str] = field(default_factory=list)
-    last_action_result: Optional[str] = None
-    discussion_contributions: List[str] = field(default_factory=list)
 
 @dataclass
 class GameState:
-    """Tracks overall game state"""
-    current_phase: GamePhase = GamePhase.SETUP
-    players: Dict[int, PlayerState] = field(default_factory=dict)
+    """Represents the current state of the game"""
+    players: Dict[int, Player] = field(default_factory=dict)
     living_players: Set[int] = field(default_factory=set)
     dead_players: Set[int] = field(default_factory=set)
+    current_phase: GamePhase = GamePhase.SETUP
     day_count: int = 0
+    game_events: List[str] = field(default_factory=list)
     phase_messages: List[str] = field(default_factory=list)
-    action_queue: List[Tuple[int, str]] = field(default_factory=list)
+    current_mafia_votes: Dict[int, int] = field(default_factory=dict)
     vote_counts: Dict[int, int] = field(default_factory=dict)
-    mafia_votes: Dict[int, int] = field(default_factory=dict)
     protected_player: Optional[int] = None
     investigation_results: Dict[int, PlayerRole] = field(default_factory=dict)
-    discussion_round: int = 0
-    phase_history: List[str] = field(default_factory=list)
-    game_events: List[str] = field(default_factory=list)
+    mafia_kill_target: Optional[int] = None
+    abstain_count: int = 0
+    player_votes: Dict[int, int] = field(default_factory=dict)
+    player_actions: Dict[int, str] = field(default_factory=dict)
+    discussion_rounds: Dict[int, Dict[int, str]] = field(default_factory=lambda: defaultdict(dict))
     win_condition: Optional[str] = None
-    rounds_without_kill: int = 0
-    mafia_coordination_attempts: int = 0
-    mafia_team_chat: List[str] = field(default_factory=list)
-    current_mafia_votes: Dict[int, int] = field(default_factory=dict)
+
+    def reset_night_actions(self):
+        """Reset all night phase state"""
+        self.current_mafia_votes.clear()
+        self.mafia_kill_target = None
+        self.protected_player = None
+        self.player_actions.clear()
+        for player in self.players.values():
+            player.night_action_used = False
 
 @dataclass
 class MafiaConfig:
@@ -76,310 +78,812 @@ class MafiaConfig:
     max_turns: int = 100
     roles: Dict[PlayerRole, int] = field(default_factory=lambda: {
         PlayerRole.MAFIA: 2,
-        PlayerRole.DETECTIVE: 1,
+        PlayerRole.VILLAGER: 3,
         PlayerRole.DOCTOR: 1,
-        PlayerRole.VILLAGER: 3
+        PlayerRole.DETECTIVE: 1
     })
-    max_discussion_rounds: int = 3
-    night_action_timeout: int = 30
-    discussion_timeout: int = 60
-    voting_timeout: int = 30
-    max_rounds_without_kill: int = 5
+    min_players: int = 7
+    max_players: int = 7
+    discussion_rounds: int = 5
+    vote_threshold: float = 0.5  # Percentage of votes needed for execution
 
 class MafiaGame:
+    """Main game class for Mafia game"""
     def __init__(self, run_dir: Path, max_turns: int = 100):
-        """Initialize the Mafia game"""
+        self.state = GameState()
         self.config = MafiaConfig(
             run_dir=run_dir,
             max_turns=max_turns
         )
-        self.state = GameState()
+        self.players = []  # List of player objects
         
-        # Action validation patterns
-        self.kill_pattern = re.compile(r"KILL:\s*(\d+)")
-        self.save_pattern = re.compile(r"SAVE:\s*(\d+)")
-        self.investigate_pattern = re.compile(r"INVESTIGATE:\s*(\d+)")
-        self.vote_pattern = re.compile(r"VOTE:\s*(\d+)")
-        self.say_pattern = re.compile(r"SAY:\s*(.+)")
-        self.team_pattern = re.compile(r"TEAM:\s*(.+)")
+        # Regex patterns for action parsing
+        self.say_pattern = re.compile(r'^SAY:\s*(.+)$', re.IGNORECASE)
+        self.vote_pattern = re.compile(r'^VOTE:\s*(\d+)$', re.IGNORECASE)
+        self.kill_pattern = re.compile(r'^KILL:\s*(\d+)$', re.IGNORECASE)
+        self.save_pattern = re.compile(r'^SAVE:\s*(\d+)$', re.IGNORECASE)
+        self.investigate_pattern = re.compile(r'^INVESTIGATE:\s*(\d+)$', re.IGNORECASE)
         
         # Game metadata
         self.start_time = datetime.now().isoformat()
         self.end_time = None
 
-        
     def get_system_prompt(self) -> Dict[str, str]:
-        """Return the system prompt for LLM players"""
+        """Get the system prompt for the current player"""
+        role_prompts = {
+            "mafia": """You are a Mafia member in a game of Mafia.
+                Your goal is to eliminate all non-Mafia players.
+                
+                During the night phase:
+                - Coordinate with other Mafia members to choose a target
+                - Use 'KILL: player_id' to vote for killing a player
+                
+                During the day phase:
+                - Try to avoid suspicion
+                - Blend in with villagers
+                - Vote to eliminate other players using 'VOTE: player_id'
+                
+                Win condition: Eliminate all non-Mafia players.""",
+            
+            "villager": """You are a Villager in a game of Mafia.
+                Your goal is to identify and eliminate all Mafia members.
+                
+                During the day phase:
+                - Discuss with other players to identify suspicious behavior
+                - Vote to eliminate suspected Mafia members using 'VOTE: player_id'
+                
+                Win condition: Help eliminate all Mafia members.""",
+            
+            "detective": """You are the Detective in a game of Mafia.
+                Your goal is to investigate players and help eliminate all Mafia members.
+                
+                During the night phase:
+                - Investigate one player using 'INVESTIGATE: player_id'
+                - You will learn their true role
+                
+                During the day phase:
+                - Use your investigation results to guide the town
+                - Vote to eliminate suspected Mafia members using 'VOTE: player_id'
+                
+                Win condition: Help eliminate all Mafia members.""",
+            
+            "doctor": """You are the Doctor in a game of Mafia.
+                Your goal is to protect players and help eliminate all Mafia members.
+                
+                During the night phase:
+                - Protect one player using 'SAVE: player_id'
+                - Protected players cannot be killed that night
+                Note: Cannot protect the same player two nights in a row.
+                
+                During the day phase:
+                - Vote to eliminate suspected Mafia members using 'VOTE: player_id'
+                
+                Win condition: Help eliminate all Mafia members."""
+        }
+
+        # Return default prompt during setup
+        if self.state.current_phase == GamePhase.SETUP:
+            return {
+                "role": "system",
+                "content": "You are playing a game of Mafia. Wait for your role to be assigned."
+            }
+
+        # Get the current player's role and return appropriate prompt
+        player_id = len(self.players)  # Current player being initialized
+        if player_id not in self.state.players:
+            return {
+                "role": "system",
+                "content": "You are playing a game of Mafia. Wait for your role to be assigned."
+            }
+
         return {
             "role": "system",
-            "content": """You are playing Mafia, a game of social deduction. There are 7 players:
-                2 Mafia, 1 Detective, 1 Doctor, and 3 Villagers.
-                
-                Use these exact formats for actions:
-                - Mafia kill: 'KILL: player_id'
-                - Doctor save: 'SAVE: player_id'
-                - Detective investigate: 'INVESTIGATE: player_id'
-                - Day discussion: 'SAY: your_message'
-                - Voting: 'VOTE: player_id' or 'VOTE: 0' to abstain if unsure
-                - Mafia team chat: 'TEAM: your_message'
-                
-                Game Flow:
-                1. Night Phase: Special roles take actions
-                2. Day Discussion: All living players discuss
-                3. Day Voting: All living players vote to eliminate (can abstain by voting 0)
-                
-                Win Conditions:
-                - Town wins when all Mafia are eliminated
-                - Mafia wins when they equal or outnumber Town
-                
-                Use deduction to identify players to try to win the game."""
+            "content": role_prompts[self.state.players[player_id].role.value]
         }
 
     def initialize_roles(self, players: List[BaseLLMPlayer]) -> None:
-        """Randomly assign roles to players"""
-        all_roles = []
+        """Initialize player roles and game state"""
+        self.players = players
+        num_players = len(players)
+        
+        # Validate player count
+        if num_players != self.config.min_players:
+            raise ValueError(f"Expected {self.config.min_players} players, got {num_players}")
+
+        # Create list of roles
+        roles = []
         for role, count in self.config.roles.items():
-            all_roles.extend([role] * count)
-        random.shuffle(all_roles)
+            roles.extend([role] * count)
         
-        mafia_members = []
-        print("\n=== GAME SETUP ===")
+        # Shuffle roles
+        random.shuffle(roles)
+        
+        # Assign roles to players
+        print("\n==================================================")
+        print("                    GAME SETUP")
+        print("==================================================\n")
+        
         print("Role Assignments:")
+        print("-" * 30)
         
-        for idx, role in enumerate(all_roles):
-            player_id = idx + 1
-            self.state.players[player_id] = PlayerState(role=role)
-            self.state.living_players.add(player_id)
-            print(f"Player {player_id}: {role.value}")
+        mafia_team = []
+        for i, role in enumerate(roles, 1):
+            player = Player(role=role)
+            self.state.players[i] = player
+            self.state.living_players.add(i)
+            print(f"Player {i:2d}: {role.value:8s}")
             
             if role == PlayerRole.MAFIA:
-                mafia_members.append(player_id)
+                mafia_team.append(i)
         
-        print(f"\nMafia Team: Players {mafia_members}")
-        print("=================\n")
-                
-        # Share mafia member information
-        for member_id in mafia_members:
-            team_info = f"You are Mafia. Your teammate is Player {[m for m in mafia_members if m != member_id][0]}"
-            self.state.players[member_id].team_messages.append(team_info)
-            
-    def get_current_state(self, player_id: Optional[int] = None) -> str:
-        base_state = (
-            f"Day {self.state.day_count}\n"
-            f"Phase: {self.state.current_phase.value}\n"
-            f"Living players: {sorted(self.state.living_players)}\n"
-            f"Dead players: {sorted(self.state.dead_players)}\n\n"
-        )
+        print(f"\nMafia Team: Players {mafia_team}")
+        print("=" * 50 + "\n")
 
-        if player_id is None:
-            return base_state
-
-        # Add clear self-identification
-        base_state += f"You are Player {player_id}\n"
+    def get_current_state(self, player_id: int) -> str:
+        """Get the current game state for a player"""
+        player = self.state.players[player_id]
         
-        player_state = self.state.players[player_id]
-        base_state += f"Your role: {player_state.role.value}\n"
+        # Base state info
+        base_state = f"Day {self.state.day_count}\n"
+        base_state += f"Phase: {self.state.current_phase.value}\n"
+        base_state += f"Living players: {sorted(list(self.state.living_players))}\n"
+        base_state += f"Dead players: {sorted(list(self.state.dead_players))}\n\n"
         
-        # Add team information for Mafia
-        if player_state.role == PlayerRole.MAFIA:
-            # Find Mafia teammate
-            mafia_teammates = [
-                pid for pid, p in self.state.players.items()
-                if p.role == PlayerRole.MAFIA and pid != player_id
-            ]
-            
-            for teammate_id in mafia_teammates:
-                teammate_status = "alive" if teammate_id in self.state.living_players else "dead"
-                base_state += f"Your Mafia teammate is Player {teammate_id} ({teammate_status})\n"
-                
-            if self.state.current_phase == GamePhase.NIGHT:
-                if player_id in self.state.mafia_votes:
-                    base_state += f"You voted to kill Player {self.state.mafia_votes[player_id]}\n"
-                    for teammate_id in mafia_teammates:
-                        if teammate_id in self.state.mafia_votes:
-                            base_state += f"Your teammate voted to kill Player {self.state.mafia_votes[teammate_id]}\n"
-
-        # Add role-specific information
-        elif player_state.role == PlayerRole.DETECTIVE:
-            investigation_results = []
-            for target, role in self.state.investigation_results.items():
-                investigation_results.append(
-                    f"Player {target}: {'Mafia' if role == PlayerRole.MAFIA else 'Town'}"
-                )
-            if investigation_results:
-                base_state += "Investigation results:\n" + "\n".join(investigation_results) + "\n"
-
-        elif player_state.role == PlayerRole.DOCTOR:
-            if player_id == self.state.protected_player:
-                base_state += "You protected yourself last night.\n"
-            elif self.state.protected_player:
-                base_state += f"You protected Player {self.state.protected_player} last night.\n"
+        # Add player-specific info
+        base_state += f"\nYou are Player {player_id}\n"
+        base_state += f"Your role: {player.role.value}\n"
+        
+        # Show private messages
+        if player.private_messages:
+            base_state += "\nPrivate Messages:\n"
+            base_state += "\n".join(player.private_messages[-5:]) + "\n"
 
         # Add discussion history during day phase
-        if self.state.current_phase == GamePhase.DAY_DISCUSSION:
-            recent_messages = self.state.phase_messages[-10:]  # Show last 10 messages
-            if recent_messages:
-                base_state += "\nRecent Discussion:\n" + "\n".join(recent_messages) + "\n"
+        if self.state.current_phase == GamePhase.DAY:
+            if self.state.discussion_rounds:
+                base_state += "\nRecent Discussion:\n"
+                for round_num, round_messages in self.state.discussion_rounds.items():
+                    base_state += f"\nRound {round_num}:\n"
+                    for player_id, message in round_messages.items():
+                        base_state += f"Player {player_id}: {message}\n"
+
+        # Add game events
+        if self.state.game_events:
+            base_state += "\nRecent Events:\n"
+            base_state += "\n".join(self.state.game_events[-5:]) + "\n"
 
         action_prompt = self._get_action_prompt(player_id)
         return base_state + "\n" + action_prompt
 
     def _get_action_prompt(self, player_id: int) -> str:
-        """Get the appropriate action prompt with clear player identification"""
+        """Get the appropriate action prompt with clear instructions"""
         player = self.state.players[player_id]
         
         if not player.is_alive:
-            return f"You (Player {player_id}) are dead. Watch the game proceed."
+            return f"You (Player {player_id}) are dead and cannot take actions."
             
         if self.state.current_phase == GamePhase.NIGHT:
-            if player.night_action_used:
+            if player.night_action_used and player.role != PlayerRole.MAFIA:
                 return f"You (Player {player_id}) have already used your night action."
                 
             prompts = {
-                PlayerRole.MAFIA: f"Submit your kill target with 'KILL: player_id' (you cannot target yourself or your teammate)",
-                PlayerRole.DOCTOR: f"Choose a player to protect with 'SAVE: player_id'",
-                PlayerRole.DETECTIVE: f"Investigate a player with 'INVESTIGATE: player_id' (you cannot target yourself)",
+                PlayerRole.MAFIA: (
+                    f"You are Player {player_id} (Mafia).\n"
+                    "IMPORTANT: Both mafia members MUST submit a kill vote to successfully kill someone.\n"
+                    "- Use 'SAY: message' to chat with your teammate (3 messages max)\n"
+                    "- Use 'KILL: player_id' to vote for a target\n"
+                    "- If you don't vote, or if votes don't match, no one will be killed\n"
+                    "- DO NOT put KILL commands in chat messages\n"
+                    "- Coordinate through chat, then vote separately"
+                ),
+                PlayerRole.DOCTOR: (
+                    f"Choose a player to protect with 'SAVE: player_id'\n"
+                    "- You cannot protect the same player two nights in a row\n"
+                    "- You will learn if your protected player was attacked"
+                ),
+                PlayerRole.DETECTIVE: (
+                    f"Investigate a player with 'INVESTIGATE: player_id'\n"
+                    "- You cannot investigate yourself\n"
+                    "- You cannot investigate the same player twice\n"
+                    "- Investigation results are permanent"
+                ),
                 PlayerRole.VILLAGER: f"You (Player {player_id}) are a Villager. Wait for night phase to end."
             }
             return prompts[player.role]
             
-        elif self.state.current_phase == GamePhase.DAY_DISCUSSION:
-            return f"You (Player {player_id}) can participate in discussion using 'SAY: your_message'"
+        elif self.state.current_phase == GamePhase.DAY:
+            return (
+                f"You (Player {player_id}) can participate in discussion using 'SAY: your_message'\n"
+                "- Keep messages relevant to the game\n"
+                "- Do not include action commands in messages"
+            )
             
-        elif self.state.current_phase == GamePhase.DAY_VOTING:
-            return f"You (Player {player_id}) must vote for elimination using 'VOTE: player_id' (cannot vote for yourself)"
+        return "Waiting for next phase..."
+
+    def _handle_player_action(self, player_id: int, action: str) -> Dict:
+        """Handle a player's night action"""
+        player = self.state.players[player_id]
+        
+        if not player.is_alive:
+            return {
+                "valid": False,
+                "message": "Dead players cannot take actions",
+                "end_turn": False
+            }
             
-        return ""
+        if player.night_action_used:
+            return {
+                "valid": False,
+                "message": "You have already used your night action",
+                "end_turn": False
+            }
+            
+        # Store the action
+        self.state.player_actions[player_id] = action
+        
+        # Mark action as used for non-mafia roles
+        if player.role != PlayerRole.MAFIA:
+            player.night_action_used = True
+            
+        return {
+            "valid": True,
+            "message": "Action recorded",
+            "end_turn": True
+        }
+
+    def _handle_mafia_coordination(self) -> None:
+        """Handle the mafia team coordination and voting process"""
+        print("\nMafia Team Coordination:")
+        print("-" * 30 + "\n")
+        
+        # Reset mafia votes at start of coordination
+        self.state.current_mafia_votes.clear()
+        self.state.mafia_kill_target = None
+        
+        # Get living mafia members
+        living_mafia = [pid for pid in self.state.players 
+                        if self.state.players[pid].role == PlayerRole.MAFIA and self.state.players[pid].is_alive]
+        if not living_mafia:
+            return
+            
+        # Phase 1: Chat Phase
+        print("Chat Phase:")
+        print("-" * 20)
+        for mafia_id in living_mafia:
+            current_player = self.players[mafia_id - 1]
+            
+            state_message = {
+                "role": "user",
+                "content": (
+                    self.get_current_state(mafia_id) + 
+                    "\nCoordinate with your fellow mafia members. Send a chat message using 'SAY: message'"
+                )
+            }
+            response = current_player.get_response(state_message, self.get_game_image())
+            
+            chat_match = self.say_pattern.match(response)
+            if chat_match:
+                message = chat_match.group(1).split('\n')[0].strip()
+                if "KILL:" not in message.upper():
+                    team_message = f"Player {mafia_id:2d}: {message}"
+                    print(team_message)
+        
+        # Phase 2: Voting Phase
+        print("\nVoting Phase:")
+        print("-" * 20)
+        for mafia_id in living_mafia:
+            current_player = self.players[mafia_id - 1]
+            
+            state_message = {
+                "role": "user",
+                "content": (
+                    self.get_current_state(mafia_id) + 
+                    "\nNow submit your kill vote using 'KILL: player_id'\n" +
+                    "- You must vote to kill someone\n" +
+                    "- Both mafia members must agree on the target\n" +
+                    "- You cannot kill another mafia member"
+                )
+            }
+            response = current_player.get_response(state_message, self.get_game_image())
+            
+            vote_match = self.kill_pattern.match(response)
+            if vote_match:
+                target = int(vote_match.group(1))
+                if target in self.state.living_players and target not in living_mafia:
+                    self.state.current_mafia_votes[mafia_id] = target
+                    print(f"Player {mafia_id:2d} voted to kill Player {target}")
+        
+        # Results
+        print("\nResults:")
+        print("-" * 20)
+        if len(self.state.current_mafia_votes) == len(living_mafia):
+            votes = list(self.state.current_mafia_votes.values())
+            if len(set(votes)) == 1:
+                self.state.mafia_kill_target = votes[0]
+                print(f"Mafia team agreed on killing Player {self.state.mafia_kill_target}")
+            else:
+                print("Mafia team could not agree on a target. No kill tonight.")
+        else:
+            print("Not all mafia members voted. No kill tonight.")
+        print()
+
+    def _handle_night_actions(self) -> None:
+        """Handle night actions for Doctor and Detective"""
+        print("\nSpecial Role Actions:")
+        print("-" * 30)
+        
+        # Process Doctor action
+        doctor_id = next((pid for pid, p in self.state.players.items() 
+                         if p.role == PlayerRole.DOCTOR and p.is_alive), None)
+        if doctor_id:
+            current_player = self.players[doctor_id - 1]
+            state_message = {
+                "role": "user",
+                "content": self.get_current_state(doctor_id)
+            }
+            response = current_player.get_response(state_message, self.get_game_image())
+            
+            match = self.save_pattern.match(response)
+            if match:
+                target_id = int(match.group(1))
+                if target_id in self.state.living_players and target_id != self.state.protected_player:
+                    self.state.protected_player = target_id
+                    self.state.players[doctor_id].night_action_used = True
+                    print(f"\nDoctor Action:")
+                    print("-" * 20)
+                    print(f"Player {doctor_id:2d} protected Player {target_id}")
+                    
+                    # Enhanced Doctor feedback
+                    if self.state.mafia_kill_target == target_id:
+                        morning_feedback = f"SUCCESS! Your protection saved Player {target_id} from a Mafia attack!"
+                        self.state.game_events.append("Someone was attacked but saved by the Doctor!")
+                    else:
+                        morning_feedback = f"Player {target_id} was not attacked last night. Your protection was not needed."
+                    self.state.players[doctor_id].private_messages.append(morning_feedback)
+        
+        # Process Detective action
+        detective_id = next((pid for pid, p in self.state.players.items() 
+                           if p.role == PlayerRole.DETECTIVE and p.is_alive), None)
+        if detective_id:
+            current_player = self.players[detective_id - 1]
+            state_message = {
+                "role": "user",
+                "content": self.get_current_state(detective_id)
+            }
+            response = current_player.get_response(state_message, self.get_game_image())
+            
+            match = self.investigate_pattern.match(response)
+            if match:
+                target_id = int(match.group(1))
+                if target_id in self.state.living_players and target_id != detective_id and target_id not in self.state.investigation_results:
+                    target_role = self.state.players[target_id].role
+                    self.state.players[detective_id].night_action_used = True
+                    print(f"\nDetective Action:")
+                    print("-" * 20)
+                    print(f"Player {detective_id:2d} investigated Player {target_id}")
+                    
+                    # Enhanced Detective feedback based on role discovered
+                    if target_role == PlayerRole.MAFIA:
+                        morning_feedback = f"ALERT! Your investigation revealed: Player {target_id} is a MAFIA member!"
+                    elif target_role == PlayerRole.DOCTOR:
+                        morning_feedback = f"Your investigation revealed: Player {target_id} is the DOCTOR - a Town ally!"
+                    elif target_role == PlayerRole.VILLAGER:
+                        morning_feedback = f"Your investigation revealed: Player {target_id} is a VILLAGER - a Town member."
+                    else:
+                        morning_feedback = f"Your investigation revealed: Player {target_id} is a {target_role.value}"
+                    
+                    self.state.players[detective_id].private_messages.append(morning_feedback)
+                    self.state.investigation_results[target_id] = target_role
+                    self.state.game_events.append("The Detective has investigated someone tonight.")
+        print()
 
     def _process_night_actions(self) -> None:
-        """Process night actions in strict order"""
-        # Detective Phase
-        print("\nDetective Results:")
-        for target_id, result in self.state.investigation_results.items():
-            print(f"Player {target_id} investigated: {result}")
-    
-        # Mafia Phase
-        print("\nMafia Coordination:")
-        print(f"Current votes: {self.state.mafia_votes}")
-        print(f"Coordination attempts: {self.state.mafia_coordination_attempts}")
-        mafia_kill_target = self._handle_mafia_coordination()
-        print(f"Final kill target: {mafia_kill_target}")
-
-        # Doctor Phase
-        protected_id = None
-        for player_id, player in self.state.players.items():
-            if player.role == PlayerRole.DOCTOR and player.current_action:
-                match = self.save_pattern.match(player.current_action)
-                if match:
-                    protected_id = int(match.group(1))
-                    self.state.protected_player = protected_id
-
-        print("\nDoctor Action:")
-        print(f"Protected player: {self.state.protected_player}")
-
-        # Resolve Kill Attempt
-        if mafia_kill_target:
-            if mafia_kill_target == protected_id:
-                save_message = "The Doctor successfully saved their target! Your kill attempt failed."
-                self.state.game_events.append("Someone was targeted but saved by the Doctor!")
-                # Notify mafia members about the failed kill
-                for player_id, player in self.state.players.items():
-                    if player.role == PlayerRole.MAFIA:
-                        player.team_messages.append(save_message)
-                self.state.rounds_without_kill += 1
+        """Process all night actions in correct order"""
+        print("\nNight Phase Results:")
+        print("-" * 30 + "\n")
+        
+        # Process investigation results before any deaths
+        if len(self.state.investigation_results) > len(self.state.players[next(pid for pid, p in self.state.players.items() if p.role == PlayerRole.DETECTIVE)].private_messages):
+            detective_id = next(pid for pid, p in self.state.players.items() if p.role == PlayerRole.DETECTIVE)
+            last_target = max(self.state.investigation_results.keys())
+            target_role = self.state.investigation_results[last_target]
+            
+            # Enhanced Detective feedback based on role discovered
+            if target_role == PlayerRole.MAFIA:
+                morning_feedback = f"ALERT! Your investigation revealed: Player {last_target} is a MAFIA member!"
+            elif target_role == PlayerRole.DOCTOR:
+                morning_feedback = f"Your investigation revealed: Player {last_target} is the DOCTOR - a Town ally!"
+            elif target_role == PlayerRole.VILLAGER:
+                morning_feedback = f"Your investigation revealed: Player {last_target} is a VILLAGER - a Town member."
             else:
-                self.state.players[mafia_kill_target].is_alive = False
-                self.state.living_players.remove(mafia_kill_target)
-                self.state.dead_players.add(mafia_kill_target)
-                self.state.game_events.append(f"Player {mafia_kill_target} was killed in the night!")
-                self.state.rounds_without_kill = 0
-        else:
-            self.state.game_events.append("The night passes quietly. No one was killed.")
-            self.state.rounds_without_kill += 1
-
-        print("\nNight Results:")
-        for event in self.state.game_events[-3:]:
-            print(event)
-
-    def _handle_mafia_coordination(self) -> Optional[int]:
-        """Handle mafia team coordination for kill target"""
-        living_mafia = [pid for pid in self.state.living_players 
-                        if self.state.players[pid].role == PlayerRole.MAFIA]
-        
-        if len(living_mafia) != 2:
-            # If only one mafia, they can act alone
-            if len(living_mafia) == 1 and living_mafia[0] in self.state.mafia_votes:
-                return self.state.mafia_votes[living_mafia[0]]
-            return None
-
-        print(f"\nMafia Team ({living_mafia})")
-        print(f"Coordination Attempt {self.state.mafia_coordination_attempts + 1}/3:")
-        
-        # Get current votes
-        vote1 = self.state.mafia_votes.get(living_mafia[0])
-        vote2 = self.state.mafia_votes.get(living_mafia[1])
-
-        if vote1 is None or vote2 is None:
-            # Still waiting for votes
-            return None
-
-        if vote1 == vote2:
-            # Success! Both agree
-            coordination_message = f"Mafia team agreed on target: Player {vote1}"
-            print(f"Success! {coordination_message}")
-            for mafia_id in living_mafia:
-                self.state.players[mafia_id].team_messages.append(coordination_message)
-            return vote1
-
-        # Disagreement - initiate team chat
-        self.state.mafia_coordination_attempts += 1
-        print(f"Disagreement: Player {living_mafia[0]} voted {vote1}, Player {living_mafia[1]} voted {vote2}")
-        
-        if self.state.mafia_coordination_attempts >= 3:
-            fail_message = "No agreement reached after 3 attempts. No kill tonight."
-            print(fail_message)
-            for mafia_id in living_mafia:
-                self.state.players[mafia_id].team_messages.append(fail_message)
-            return None
-
-        # Clear current votes and notify team
-        disagree_message = (
-            f"Vote mismatch (Attempt {self.state.mafia_coordination_attempts}/3): "
-            f"Player {living_mafia[0]} voted for {vote1}, "
-            f"Player {living_mafia[1]} voted for {vote2}. "
-            "Discuss and try again."
-        )
-        
-        self.state.mafia_votes.clear()
-        for mafia_id in living_mafia:
-            self.state.players[mafia_id].team_messages.append(disagree_message)
-            
-            # Send new state message to force revote
-            self.state.players[mafia_id].night_action_used = False
-            state_message = self.get_current_state(mafia_id)
-            self.state.players[mafia_id].private_messages.append({
-                "role": "user",
-                "content": state_message + "\n" + disagree_message
-            })
-
-        return None
-
-    def _get_mafia_target(self) -> Optional[int]:
-        """Determine final mafia target from votes"""
-        if not self.state.mafia_votes:
-            return None
-            
-        # Get all mafia members
-        mafia_members = [pid for pid, p in self.state.players.items() 
-                        if p.role == PlayerRole.MAFIA and p.is_alive]
-                        
-        # If all living mafia voted and agree
-        if len(self.state.mafia_votes) == len(mafia_members):
-            votes = list(self.state.mafia_votes.values())
-            if all(v == votes[0] for v in votes):
-                return votes[0]
+                morning_feedback = f"Your investigation revealed: Player {last_target} is a {target_role.value}"
                 
-        return None
+            self.state.players[detective_id].private_messages.append(morning_feedback)
+        
+        # Process kill attempt
+        if self.state.mafia_kill_target is not None:
+            target = self.state.players[self.state.mafia_kill_target]
+            if self.state.mafia_kill_target == self.state.protected_player:
+                print("Kill Attempt: Failed - Target was protected")
+                print(f"Mafia tried to kill Player {self.state.mafia_kill_target}, but they were protected!")
+                self.state.game_events.append("Someone was attacked but saved by the Doctor!")
+            else:
+                target.is_alive = False
+                self.state.living_players.remove(self.state.mafia_kill_target)
+                self.state.dead_players.add(self.state.mafia_kill_target)
+                print("Kill Attempt: Successful")
+                print(f"Player {self.state.mafia_kill_target} was killed")
+                self.state.game_events.append(f"Player {self.state.mafia_kill_target} was killed in the night!")
+        else:
+            print("Kill Attempt: None")
+            print("The night passes quietly. No one was killed.")
+            self.state.game_events.append("The night passes quietly. No one was killed.")
+        
+        print("\nPlayer Status:")
+        print("-" * 20)
+        print(f"Living players: {sorted(list(self.state.living_players))}")
+        if self.state.dead_players:
+            print(f"Dead players: {sorted(list(self.state.dead_players))}")
+        print()
+
+    def _validate_target(self, target_id: int, actor_id: int) -> bool:
+        """Validate if a target selection is valid"""
+        # Check if target exists and is alive
+        if target_id not in self.state.players or target_id not in self.state.living_players:
+            return False
+            
+        # Prevent self-targeting for most actions
+        if target_id == actor_id and self.state.players[actor_id].role != PlayerRole.DOCTOR:
+            return False
+            
+        # Prevent mafia targeting other mafia
+        if (self.state.players[actor_id].role == PlayerRole.MAFIA and 
+            self.state.players[target_id].role == PlayerRole.MAFIA):
+            return False
+            
+        return True
+
+    def _reset_night_actions(self) -> None:
+        """Reset all night action flags"""
+        for player in self.state.players.values():
+            player.night_action_used = False
+            self.state.players[player].private_messages = []
+            
+        self.state.mafia_votes.clear()
+        self.state.protected_player = None
+        self.state.mafia_team_chat.clear()  # Clear team chat for next night
+        self.state.current_mafia_votes.clear()
+        self.state.mafia_kill_target = None
+
+    def _check_win_condition(self) -> bool:
+        """Check if either faction has won"""
+        mafia_count = sum(1 for p in self.state.players.values() 
+                        if p.role == PlayerRole.MAFIA and p.is_alive)
+                        
+        town_count = sum(1 for p in self.state.players.values()
+                        if p.role != PlayerRole.MAFIA and p.is_alive)
+
+        if mafia_count == 0:
+            self.state.win_condition = "Town wins! All mafia eliminated."
+            return True
+            
+        if mafia_count >= town_count:
+            self.state.win_condition = "Mafia wins! They equal or outnumber the town."
+            return True
+            
+        return False
+
+    def _get_vote_results_announcement(self) -> str:
+        """Format voting results announcement"""
+        results = ["=== Voting Results ==="]
+        
+        # Show who voted for whom
+        vote_details = []
+        for voter_id, target_id in self.state.player_votes.items():
+            if target_id == 0:
+                vote_details.append(f"Player {voter_id} abstained")
+            else:
+                vote_details.append(f"Player {voter_id} voted for Player {target_id}")
+        if vote_details:
+            results.extend(vote_details)
+        
+        # Show final vote tallies
+        results.append("\nFinal Vote Count:")
+        for player_id, votes in self.state.vote_counts.items():
+            results.append(f"Player {player_id}: {votes} votes")
+        if self.state.abstain_count > 0:
+            results.append(f"Abstained: {self.state.abstain_count} players")
+            
+        # Add elimination result
+        if self.state.game_events:
+            results.append(f"\nResult: {self.state.game_events[-1]}")
+            
+        return "\n".join(results)
+
+    def _process_elimination(self) -> None:
+        """Process voting results and eliminate player if clear majority"""
+        print("\nVoting Results:")
+        print("-" * 30)
+        
+        total_votes = sum(self.state.vote_counts.values())
+        votes_needed = len(self.state.living_players) // 2 + 1
+        
+        print(f"Vote counts: {dict(self.state.vote_counts)}")
+        print(f"Abstained: {len(self.state.living_players) - total_votes}")
+        print(f"Votes needed for majority: {votes_needed}")
+        
+        if total_votes < len(self.state.living_players):
+            print(f"Warning: Only {total_votes} out of {len(self.state.living_players)} living players voted")
+            print()
+            return
+            
+        if not self.state.vote_counts:
+            print("No votes cast.")
+            print()
+            return
+            
+        # Find player with most votes
+        max_votes = max(self.state.vote_counts.values())
+        players_with_max = [pid for pid, votes in self.state.vote_counts.items() 
+                          if votes == max_votes]
+                          
+        if len(players_with_max) > 1:
+            print(f"Tie between players {players_with_max}. No one was eliminated.")
+            print()
+            return
+            
+        eliminated_id = players_with_max[0]
+        if self.state.vote_counts[eliminated_id] >= votes_needed:
+            self.state.players[eliminated_id].is_alive = False
+            self.state.living_players.remove(eliminated_id)
+            self.state.dead_players.add(eliminated_id)
+            print(f"\nPlayer {eliminated_id} was eliminated by town vote!")
+            print(f"They were a {self.state.players[eliminated_id].role.value}")
+            self.state.game_events.append(f"Player {eliminated_id} was eliminated by town vote!")
+        else:
+            print("No majority reached. No one was eliminated.")
+            print()
+            
+    def _start_discussion(self) -> None:
+        """Start the day discussion phase"""
+        self.state.current_phase = GamePhase.DAY
+        self.state.day_count += 1
+        self._reset_votes()
+        
+        # Clear discussion tracking for new round
+        self.state.discussion_rounds.clear()
+
+    def _handle_discussion(self, response: str, player_id: int, round_num: int) -> Dict:
+        """Process discussion phase actions"""
+        if not self.state.players[player_id].is_alive:
+            return {
+                "valid": False,
+                "message": "Dead players cannot participate in discussion.",
+                "end_turn": True
+            }
+
+        match = self.say_pattern.match(response)
+        if not match:
+            return {
+                "valid": False,
+                "message": "Invalid discussion format. Use 'SAY: your_message'",
+                "end_turn": False
+            }
+
+        message = match.group(1).strip()
+        if not message:
+            return {
+                "valid": False,
+                "message": "Message cannot be empty",
+                "end_turn": False
+            }
+
+        # Store message for this specific round
+        self.state.discussion_rounds[round_num][player_id] = message
+
+        return {
+            "valid": True,
+            "message": "Message recorded.",
+            "end_turn": True
+        }
+
+    def _process_discussion_phase(self) -> None:
+        """Process the discussion phase"""
+        print("\n==================================================")
+        print("                    DAY DISCUSSION")
+        print("==================================================\n")
+
+        # Show recent events at start of day
+        if len(self.state.game_events) > 0:
+            print("Recent Events:")
+            print("-" * 20)
+            for event in self.state.game_events[-3:]:  # Show last 3 events
+                print(event)
+            print("\n")
+            self.state.game_events.clear()  # Clear events after showing
+
+        # Run 5 rounds of discussion
+        for round_num in range(1, self.config.discussion_rounds + 1):
+            print(f"\nDiscussion Round {round_num}:")
+            print("-" * 20 + "\n")
+            
+            # Get response from each living player
+            for player_id in sorted(self.state.living_players):
+                current_player = self.players[player_id - 1]  # Adjust for 0-based indexing
+                
+                # Get player's message
+                state_message = self._get_discussion_state(player_id, round_num)
+                response = current_player.get_response(state_message, self.get_game_image())
+                
+                # Process the response
+                say_match = self.say_pattern.match(response)
+                if say_match:
+                    message = say_match.group(1).strip()
+                    self.state.discussion_rounds[round_num][player_id] = message
+                    
+                    print(f"\nPlayer {player_id:2d} says:")
+                    print("-" * 20)
+                    print(message + "\n")
+
+    def _get_discussion_state(self, player_id: int, round_num: int) -> str:
+        """Get the discussion state for a player"""
+        state = self.get_current_state(player_id)
+        
+        # Add round information
+        state += f"\nDiscussion Round {round_num} of {self.config.discussion_rounds}\n"
+        
+        # Show previous messages from this round
+        if self.state.discussion_rounds[round_num]:
+            state += "\nMessages this round:\n"
+            for pid, msg in self.state.discussion_rounds[round_num].items():
+                if pid != player_id:  # Don't show player their own message
+                    state += f"Player {pid}: {msg}\n"
+        
+        state += "\nIt's your turn to speak. Use 'SAY: your message' to contribute to the discussion."
+        return state
+
+    def _handle_vote(self, response: str, player_id: int) -> Dict:
+        """Process voting phase actions with retry logic"""
+        if not self.state.players[player_id].is_alive:
+            return {
+                "valid": False,
+                "message": "Dead players cannot vote.",
+                "end_turn": True
+            }
+            
+        match = self.vote_pattern.match(response)
+        if not match:
+            return {
+                "valid": False,
+                "message": "Invalid vote format. Use 'VOTE: player_id' or 'VOTE: 0' to abstain.",
+                "end_turn": False
+            }
+            
+        target_id = int(match.group(1))
+        
+        # Validate vote target
+        if target_id != 0 and (target_id not in self.state.living_players or target_id == player_id):
+            return {
+                "valid": False,
+                "message": "Invalid target. Choose a living player other than yourself, or 0 to abstain.",
+                "end_turn": False
+            }
+        
+        # Record the vote
+        if target_id == 0:
+            print(f"\nPlayer {player_id:2d} abstained from voting.")
+            self.state.abstain_count += 1
+            self.state.player_votes[player_id] = 0
+        else:
+            print(f"\nPlayer {player_id:2d} voted for Player {target_id}.")
+            self.state.vote_counts[target_id] = self.state.vote_counts.get(target_id, 0) + 1
+            self.state.player_votes[player_id] = target_id
+        
+        return {
+            "valid": True,
+            "message": "Vote recorded.",
+            "end_turn": True
+        }
+
+    def _reset_votes(self) -> None:
+        """Reset all voting trackers"""
+        self.state.vote_counts = {}  # Reset vote counts
+        self.state.player_votes = {}  # Reset player vote tracking
+        
+        # Reset individual player vote tracking
+        for player in self.state.players.values():
+            player.private_messages = []
+
+    def _process_voting_phase(self) -> None:
+        """Process the voting phase"""
+        print("\n==================================================")
+        print("                    VOTING PHASE")
+        print("==================================================\n")
+
+        # Reset voting state
+        self._reset_votes()
+
+        # Each living player must vote
+        for player_id in sorted(self.state.living_players):
+            current_player = self.players[player_id - 1]
+            
+            # Create voting state message
+            state = self.get_current_state(player_id)
+            state += "\nVoting Phase:\n"
+            state += "Use 'VOTE: player_id' to vote for elimination (VOTE: 0 to abstain)\n"
+            
+            if self.state.vote_counts:
+                state += "\nCurrent votes:\n"
+                for target, count in self.state.vote_counts.items():
+                    if target == 0:
+                        state += f"Abstain: {count} votes\n"
+                    else:
+                        state += f"Player {target}: {count} votes\n"
+            
+            # Get and process vote
+            response = current_player.get_response(state, self.get_game_image())
+            self._handle_vote(response, player_id)
+
+        # Process results
+        print("\nVoting Results:")
+        print("-" * 20)
+        
+        # Calculate results
+        total_votes = len(self.state.player_votes)
+        if total_votes == 0:
+            print("No votes were cast!")
+            return
+
+        # Calculate majority threshold
+        living_count = len(self.state.living_players)
+        majority_needed = (living_count // 2) + 1
+        print(f"Votes needed for majority: {majority_needed}")
+
+        # Find the player with the most votes
+        if self.state.vote_counts:
+            max_votes = max(self.state.vote_counts.values())
+            targets = [pid for pid, votes in self.state.vote_counts.items() 
+                      if votes == max_votes and pid != 0]  # Exclude abstain
+
+            if len(targets) == 1 and max_votes >= majority_needed:
+                eliminated_id = targets[0]
+                self.state.players[eliminated_id].is_alive = False
+                self.state.living_players.remove(eliminated_id)
+                self.state.dead_players.add(eliminated_id)
+                
+                print(f"\nPlayer {eliminated_id} was eliminated by town vote!")
+                print(f"They were a {self.state.players[eliminated_id].role.value}")
+                self.state.game_events.append(f"Player {eliminated_id} was eliminated by town vote!")
+            else:
+                print("\nNo majority reached. No one was eliminated.")
+
+        print("\nVoting Summary:")
+        for player_id, vote in self.state.player_votes.items():
+            if vote == 0:
+                print(f"Player {player_id} abstained")
+            else:
+                print(f"Player {player_id} voted for Player {vote}")
+
+    def get_game_result(self) -> GameResult:
+        """Get the final game result"""
+        self.end_time = datetime.now().isoformat()
+        
+        living_mafia = [pid for pid, p in self.state.players.items()
+                       if p.role == PlayerRole.MAFIA and p.is_alive]
+        living_town = [pid for pid, p in self.state.players.items()
+                       if p.role != PlayerRole.MAFIA and p.is_alive]
+        
+        return GameResult(
+            status="complete",
+            winner=self.state.win_condition,
+            metadata={
+                "days_elapsed": self.state.day_count,
+                "living_mafia": living_mafia,
+                "living_town": living_town,
+                "game_events": self.state.game_events,
+                "final_state": self.get_current_state(1)
+            }
+        )
 
     def _create_game_image(self) -> Image.Image:
         """Create visualization of current game state"""
@@ -421,475 +925,153 @@ class MafiaGame:
             img = self._create_game_image()
             buffer = io.BytesIO()
             img.save(buffer, format='PNG')
-            img.save("board.png")
             return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode()}"
         except Exception as e:
             print(f"Failed to generate game image: {e}")
             return None
-        
-    def attempt_move(self, response: str, player_id: int) -> Dict:
-        """Process any player action based on current phase"""
-        # print(f"Player {player_id} move: {response}")
-        
-        if not self.state.players[player_id].is_alive:
-            return {
-                "valid": False,
-                "message": "You are dead and cannot take actions.",
-                "end_turn": True
-            }
 
-        if self.state.current_phase == GamePhase.NIGHT:
-            return self._handle_night_action(response, player_id)
-        elif self.state.current_phase == GamePhase.DAY_DISCUSSION:
-            return self._handle_discussion(response, player_id)
-        elif self.state.current_phase == GamePhase.DAY_VOTING:
-            return self._handle_vote(response, player_id)
-            
-        return {
-            "valid": False,
-            "message": "Invalid game phase for actions.",
-            "end_turn": True
-        }
-
-    def _handle_night_action(self, response: str, player_id: int) -> Dict:
-        """Handle night phase actions with improved Mafia coordination"""
-        player = self.state.players[player_id]
-        
-        if player.night_action_used:
-            return {
-                "valid": False,
-                "message": "You have already used your night action.",
-                "end_turn": True
-            }
-
-        if player.role == PlayerRole.MAFIA:
-            match = self.kill_pattern.match(response)
-            if not match:
-                return {
-                    "valid": False,
-                    "message": "Invalid kill format. Use 'KILL: player_id'",
-                    "end_turn": False
-                }
-            
-            target_id = int(match.group(1))
-            if not self._validate_target(target_id, player_id):
-                return {
-                    "valid": False,
-                    "message": "Invalid target selection.",
-                    "end_turn": False
-                }
-
-            self.state.mafia_votes[player_id] = target_id
-            player.night_action_used = True
-
-            # Notify other mafia member if they're alive
-            other_mafia = [pid for pid in self.state.living_players 
-                        if self.state.players[pid].role == PlayerRole.MAFIA 
-                        and pid != player_id]
-            
-            if other_mafia:
-                self.state.players[other_mafia[0]].team_messages.append(
-                    f"Your teammate (Player {player_id}) voted to kill Player {target_id}"
-                )
-
-        elif player.role == PlayerRole.DOCTOR:
-            match = self.save_pattern.match(response)
-            if not match:
-                return {
-                    "valid": False,
-                    "message": "Invalid save format. Use 'SAVE: player_id'",
-                    "end_turn": False
-                }
-            target_id = int(match.group(1))
-            if not self._validate_target(target_id, player_id):
-                return {
-                    "valid": False,
-                    "message": "Invalid target selection.",
-                    "end_turn": False
-                }
-            self.state.protected_player = target_id
-            player.night_action_used = True
-
-        elif player.role == PlayerRole.DETECTIVE:
-            match = self.investigate_pattern.match(response)
-            if not match:
-                return {
-                    "valid": False,
-                    "message": "Invalid investigate format. Use 'INVESTIGATE: player_id'",
-                    "end_turn": False
-                }
-            target_id = int(match.group(1))
-            if not self._validate_target(target_id, player_id):
-                return {
-                    "valid": False,
-                    "message": "Invalid target selection.",
-                    "end_turn": False
-                }
-            self.state.investigation_results[target_id] = self.state.players[target_id].role
-            player.night_action_used = True
-
-        return {
-            "valid": True,
-            "message": "Action submitted successfully.",
-            "end_turn": True
-        }
-
-    def _handle_discussion(self, response: str, player_id: int) -> Dict:
-        """Process day discussion messages"""
-        # Only accept SAY commands during discussion
-        match = self.say_pattern.match(response)
-        if not match:
-            return {
-                "valid": False,
-                "message": "Invalid discussion format. Use 'SAY: your_message'",
-                "end_turn": False
-            }
-        
-        message = match.group(1)
-        formatted_message = f"Player {player_id} says: {message}"
-        self.state.phase_messages.append(formatted_message)
-        self.state.players[player_id].discussion_contributions.append(message)
-
-        print(f"\nDiscussion - Player {player_id} says: {response}")
-
-        return {
-            "valid": True,
-            "message": "Message shared with all players.",
-            "end_turn": True
-        }
-
-
-    def _handle_vote(self, response: str, player_id: int) -> Dict:
-        """Process voting phase actions"""
-        match = self.vote_pattern.match(response)
-        if not match:
-            return {
-                "valid": False,
-                "message": "Invalid vote format. Use 'VOTE: player_id' or 'VOTE: 0' to abstain",
-                "end_turn": False
-            }
-            
-        target_id = int(match.group(1))
-        
-        # Handle abstain vote
-        if target_id == 0:
-            vote_message = f"Player {player_id} has abstained from voting."
-            self.state.phase_messages.append(vote_message)
-            self.state.players[player_id].vote_history.append(0)
-            return {
-                "valid": True,
-                "message": "Abstain vote recorded.",
-                "end_turn": True
-            }
-        
-        # Validate vote target
-        if target_id not in self.state.living_players:
-            return {
-                "valid": False,
-                "message": "Cannot vote for dead players.",
-                "end_turn": False
-            }
-            
-        if target_id == player_id:
-            return {
-                "valid": False,
-                "message": "Cannot vote for yourself.",
-                "end_turn": False
-            }
-        
-        # Record the vote
-        self.state.vote_counts[target_id] = self.state.vote_counts.get(target_id, 0) + 1
-        self.state.players[player_id].vote_history.append(target_id)
-        
-        vote_message = f"Player {player_id} has voted."
-        self.state.phase_messages.append(vote_message)
-        
-        return {
-            "valid": True,
-            "message": "Vote recorded.",
-            "end_turn": True
-        }
-    
-    def run(self, players: List[BaseLLMPlayer]) -> Dict:
-        """Main game loop with proper ordering"""
-        self.initialize_roles(players)
-        turn = 0
-        
-        while turn < self.config.max_turns:
-            # Night Phase with strict ordering
-            self.state.current_phase = GamePhase.NIGHT
-            self._reset_night_actions()
-            
-            # 1. Detective Phase
-            for player_id in self.state.living_players:
-                player = self.state.players[player_id]
-                if player.role == PlayerRole.DETECTIVE:
-                    current_player = players[player_id - 1]
-                    state_message = {
-                        "role": "user",
-                        "content": self.get_current_state(player_id)
-                    }
-                    response = current_player.get_response(state_message, self.get_game_image())
-                    self._handle_night_action(response, player_id)
-
-            # 2. Mafia Phase
-            living_mafia = [pid for pid in self.state.living_players 
-                        if self.state.players[pid].role == PlayerRole.MAFIA]
-            for player_id in living_mafia:
-                current_player = players[player_id - 1]
-                state_message = {
-                    "role": "user",
-                    "content": self.get_current_state(player_id)
-                }
-                response = current_player.get_response(state_message, self.get_game_image())
-                self._handle_night_action(response, player_id)
-
-            # 3. Doctor Phase
-            for player_id in self.state.living_players:
-                player = self.state.players[player_id]
-                if player.role == PlayerRole.DOCTOR:
-                    current_player = players[player_id - 1]
-                    state_message = {
-                        "role": "user",
-                        "content": self.get_current_state(player_id)
-                    }
-                    response = current_player.get_response(state_message, self.get_game_image())
-                    self._handle_night_action(response, player_id)
-
-            # Process night actions in correct order
-            self._process_night_actions()
-            
-            if self._check_win_condition():
-                return self.get_game_result()
-
-            # Day Discussion Phase with proper order
-            self.state.current_phase = GamePhase.DAY_DISCUSSION
-            self.state.day_count += 1
-            
-            # Announce night results
-            night_results = self._get_night_results_announcement()
-            for player_id in self.state.living_players:
-                self.state.players[player_id].private_messages.append({
-                    "role": "user",
-                    "content": f"Day {self.state.day_count} begins.\n{night_results}"
-                })
-
-            # Five discussion rounds, ordered by player number
-            for discussion_round in range(5):
-                round_announcement = f"Discussion Round {discussion_round + 1}/3 begins."
-                for player_id in sorted(self.state.living_players):  # Maintain player order
-                    self.state.players[player_id].private_messages.append({
-                        "role": "user",
-                        "content": round_announcement
-                    })
-
-                    current_player = players[player_id - 1]
-                    state_message = {
-                        "role": "user",
-                        "content": self.get_current_state(player_id)
-                    }
-                    response = current_player.get_response(state_message, self.get_game_image())
-                    self._handle_discussion(response, player_id)
-
-                    # Share message with other living players
-                    for listener_id in self.state.living_players:
-                        if listener_id != player_id:
-                            self.state.players[listener_id].private_messages.append({
-                                "role": "user",
-                                "content": self.state.phase_messages[-1]
-                            })
-
-            # Voting Phase
-            self.state.current_phase = GamePhase.DAY_VOTING
-            self._reset_votes()
-            
-            # Announce start of voting
-            for player_id in self.state.living_players:
-                self.state.players[player_id].private_messages.append({
-                    "role": "user",
-                    "content": "Discussion has ended. Voting phase begins now. Submit your vote for elimination."
-                })
-            
-            # Collect one vote from each living player
-            vote_order = list(self.state.living_players)
-            random.shuffle(vote_order)
-            
-            for voter_id in vote_order:
-                current_player = players[voter_id - 1]
-                state_message = {
-                    "role": "user",
-                    "content": self.get_current_state(voter_id)
-                }
-                response = current_player.get_response(state_message, self.get_game_image())
-                self._handle_vote(response, voter_id)
-
-            # Process elimination
-            self._process_elimination()
-            
-            # Announce voting results to all living players
-            vote_results = self._get_vote_results_announcement()
-            for player_id in self.state.living_players:
-                self.state.players[player_id].private_messages.append({
-                    "role": "user",
-                    "content": vote_results
-                })
-            
-            if self._check_win_condition():
-                return self.get_game_result()
-                
-            turn += 1
-        
-        return self.get_game_result()
-    
-    def _get_night_results_announcement(self) -> str:
-        """Format night phase results announcement"""
-        if not self.state.game_events:
-            return "The night passes quietly."
-        return "\n".join(self.state.game_events[-3:])  # Last 3 events
-
-    def _get_vote_results_announcement(self) -> str:
-        """Format voting results announcement"""
-        results = ["Voting Results:"]
-        for player_id, votes in self.state.vote_counts.items():
-            results.append(f"Player {player_id}: {votes} votes")
-        
-        if self.state.players[max(self.state.vote_counts, key=self.state.vote_counts.get)].role == PlayerRole.MAFIA:
-            results.append("\nA member of the Mafia was eliminated!")
-        else:
-            results.append("\nA member of the Town was eliminated!")
-            
-        return "\n".join(results)
-
-    def _check_win_condition(self) -> bool:
-        """Check if either faction has won"""
-        mafia_count = sum(1 for p in self.state.players.values() 
-                        if p.role == PlayerRole.MAFIA and p.is_alive)
-                        
-        town_count = sum(1 for p in self.state.players.values()
-                        if p.role != PlayerRole.MAFIA and p.is_alive)
-
-        if mafia_count == 0:
-            self.state.win_condition = "Town wins! All mafia eliminated."
-            return True
-            
-        if mafia_count >= town_count:
-            self.state.win_condition = "Mafia wins! They equal or outnumber the town."
-            return True
-            
-        if self.state.rounds_without_kill >= self.config.max_rounds_without_kill:
-            self.state.win_condition = "Game drawn due to stalemate."
-            return True
-            
-        return False
-
-    def _validate_target(self, target_id: int, actor_id: int) -> bool:
-        """Validate if a target selection is valid"""
-        # Check if target exists and is alive
-        if target_id not in self.state.players or target_id not in self.state.living_players:
-            return False
-            
-        # Prevent self-targeting for most actions
-        if target_id == actor_id and self.state.players[actor_id].role != PlayerRole.DOCTOR:
-            return False
-            
-        # Prevent mafia targeting other mafia
-        if (self.state.players[actor_id].role == PlayerRole.MAFIA and 
-            self.state.players[target_id].role == PlayerRole.MAFIA):
-            return False
-            
-        return True
-
-    def _reset_night_actions(self) -> None:
-        """Reset all night action flags"""
+    def _process_night_phase(self) -> None:
+        """Process the entire night phase in order"""
+        # Reset night actions at start of night
         for player in self.state.players.values():
             player.night_action_used = False
-            player.was_saved = False
-            player.was_investigated = False
+        
+        # Night Phase with strict ordering
+        self.state.current_phase = GamePhase.NIGHT
+        print("\n" + "="*50)
+        print(" "*20 + "NIGHT PHASE")
+        print("="*50 + "\n")
+        
+        # 1. Mafia Coordination
+        self._handle_mafia_coordination()
+        
+        # 2. Doctor and Detective actions
+        self._handle_night_actions()
+        
+        # 3. Process night results
+        self._process_night_actions()
+
+    def run(self, players: List[BaseLLMPlayer]) -> Dict:
+        """Main game loop with proper ordering"""
+        self.players = players
+        
+        # Game setup
+        print("\n" + "="*50)
+        print(" "*20 + "GAME SETUP")
+        print("="*50 + "\n")
+        
+        self.initialize_roles(players)
+        
+        turn = 0
+        
+        while True:
+            # Night Phase
+            self._process_night_phase()
             
-        self.state.mafia_votes.clear()
-        self.state.protected_player = None
+            if self._check_win_condition():
+                break
+                
+            # Day Phase
+            self.state.current_phase = GamePhase.DAY
+            self.state.day_count += 1
+            
+            # Discussion Phase
+            self._process_discussion_phase()  # No round parameter needed anymore
+            
+            # Voting Phase
+            self._process_voting_phase()
+            
+        return self.get_game_result()
 
-    def _reset_votes(self) -> None:
-        """Reset voting trackers"""
-        self.state.vote_counts.clear()
-        for player in self.state.players.values():
-            player.received_votes = 0
-
-    def _process_elimination(self) -> None:
-        """Process voting results and eliminate player if clear majority"""
-        if not self.state.vote_counts:
-            self.state.game_events.append(
-                "No votes were cast or all players abstained. No one was eliminated."
-            )
+    def _process_mafia_night_phase(self) -> None:
+        """Process the mafia team's night phase actions"""
+        print("\nMafia Team Coordination:")
+        print("-" * 30 + "\n")
+        
+        # Reset mafia votes at start of coordination
+        self.state.current_mafia_votes.clear()
+        self.state.mafia_kill_target = None
+        
+        # Get living mafia members
+        living_mafia = [pid for pid, player in self.state.players.items() 
+                       if player.role == PlayerRole.MAFIA and player.is_alive]
+        
+        if not living_mafia:
             return
-
-        # Find player(s) with most votes
-        max_votes = max(self.state.vote_counts.values())
-        most_voted = [pid for pid, votes in self.state.vote_counts.items() 
-                    if votes == max_votes]
-
-        # Calculate total votes cast (excluding abstentions)
-        total_votes = sum(self.state.vote_counts.values())
-        living_players = len(self.state.living_players)
-        abstained = living_players - total_votes
-
-        # Only eliminate if there's a single player with the most votes
-        if len(most_voted) == 1 and max_votes > abstained:
-            player_id = most_voted[0]
-            self.state.players[player_id].is_alive = False
-            self.state.living_players.remove(player_id)
-            self.state.dead_players.add(player_id)
             
-            role_reveal = "Mafia" if self.state.players[player_id].role == PlayerRole.MAFIA else "Town"
-            self.state.game_events.append(
-                f"Player {player_id} was eliminated by town vote!\n"
-                f"They were a member of the {role_reveal}!"
-            )
+        # Phase 1: Chat Phase
+        print("Chat Phase:")
+        print("-" * 20)
+        
+        # Store messages for this round
+        mafia_messages = []
+        
+        # Each mafia member gets to send up to 3 messages
+        for _ in range(3):
+            for mafia_id in living_mafia:
+                current_player = self.players[mafia_id - 1]
+                
+                # Create mafia-specific state message
+                state = self.get_current_state(mafia_id)
+                state += "\nMafia Team Chat Phase:\n"
+                state += f"Your mafia teammate(s): Players {living_mafia}\n"
+                if mafia_messages:
+                    state += "\nPrevious messages:\n"
+                    state += "\n".join(mafia_messages)
+                state += "\n\nUse 'SAY: message' to chat with your team."
+                
+                response = current_player.get_response(state, self.get_game_image())
+                
+                chat_match = self.say_pattern.match(response)
+                if chat_match:
+                    message = chat_match.group(1).strip()
+                    if "KILL:" not in message.upper():
+                        team_message = f"Player {mafia_id}: {message}"
+                        mafia_messages.append(team_message)
+                        print(team_message)
+        
+        print("\nVoting Phase:")
+        print("-" * 20)
+        
+        # Phase 2: Voting Phase - Each mafia member must vote
+        for mafia_id in living_mafia:
+            current_player = self.players[mafia_id - 1]
+            
+            # Create mafia-specific voting state
+            state = self.get_current_state(mafia_id)
+            state += f"\nMafia Kill Vote Phase:\n"
+            state += f"Your mafia teammate(s): Players {living_mafia}\n"
+            
+            # Show current votes
+            if self.state.current_mafia_votes:
+                state += "\nCurrent votes:\n"
+                for voter, target in self.state.current_mafia_votes.items():
+                    state += f"Player {voter} voted to kill Player {target}\n"
+            
+            state += "\nUse 'KILL: player_id' to vote for tonight's target."
+            
+            # Get and process vote
+            response = current_player.get_response(state, self.get_game_image())
+            
+            vote_match = self.kill_pattern.match(response)
+            if vote_match:
+                target = int(vote_match.group(1))
+                if target in self.state.living_players and target not in living_mafia:
+                    self.state.current_mafia_votes[mafia_id] = target
+                    print(f"Player {mafia_id} voted to kill Player {target}")
+        
+        # Results
+        print("\nResults:")
+        print("-" * 20)
+        
+        # Check if all mafia voted and agreed
+        if len(self.state.current_mafia_votes) == len(living_mafia):
+            # Check if all votes are for the same target
+            targets = set(self.state.current_mafia_votes.values())
+            if len(targets) == 1:
+                self.state.mafia_kill_target = targets.pop()
+                print(f"Mafia team agreed on killing Player {self.state.mafia_kill_target}")
+            else:
+                print("Mafia team couldn't agree on a target. No kill tonight.")
         else:
-            self.state.game_events.append(
-                f"No elimination occurred. {abstained} players abstained from voting."
-            )
-
-        print("\n=== VOTING RESULTS ===")
-        print(f"Vote counts: {self.state.vote_counts}")
-        print(f"Abstained: {abstained}")
-        for event in self.state.game_events[-3:]:
-            print(event)
-
-    def get_game_result(self) -> Dict[str, str]:
-        """Get the final game result"""
-        self.end_time = datetime.now().isoformat()
-        
-        living_mafia = [pid for pid, p in self.state.players.items()
-                        if p.role == PlayerRole.MAFIA and p.is_alive]
-        living_town = [pid for pid, p in self.state.players.items()
-                        if p.role != PlayerRole.MAFIA and p.is_alive]
-        
-        return {
-            "status": "complete",
-            "winner": self.state.win_condition,
-            "days_elapsed": self.state.day_count,
-            "living_mafia": living_mafia,
-            "living_town": living_town,
-            "game_events": self.state.game_events,
-            "final_state": self.get_current_state()
-        }
-
-    def get_final_position(self) -> str:
-        """Get string representation of final game state"""
-        final_state = [
-            f"Game ended after {self.state.day_count} days",
-            f"Result: {self.state.win_condition}",
-            "\nFinal role reveal:"
-        ]
-        
-        for player_id, player in self.state.players.items():
-            status = "alive" if player.is_alive else "dead"
-            final_state.append(
-                f"Player {player_id}: {player.role.value} ({status})"
-            )
-            
-        final_state.append("\nGame events:")
-        final_state.extend(self.state.game_events)
-        
-        return "\n".join(final_state)
+            print("Not all mafia members voted. No kill tonight.")
