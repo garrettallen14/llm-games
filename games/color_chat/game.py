@@ -14,11 +14,18 @@ from games.color_chat.types import Position, Agent, WorldConfig
 class ColorChatGame:
     """Main game class that interfaces with the runner"""
     
-    def __init__(self, run_dir: Path, max_turns: int = 100):
-        """Initialize the game"""
+    def __init__(self, run_dir: Path, max_turns: int = 100, world_size: int = 10, communication_radius: int = 4):
+        """Initialize the game
+        
+        Args:
+            run_dir: Directory for game logs
+            max_turns: Maximum number of turns before game ends
+            world_size: Size of the grid (world_size x world_size)
+            communication_radius: How far messages can be heard
+        """
         self.run_dir = run_dir
         self.max_turns = max_turns
-        self.config = WorldConfig()
+        self.config = WorldConfig(size=world_size, communication_radius=communication_radius)
         self.agents: Dict[int, Agent] = {}
         self.current_turn = 0
         self.game_over = False
@@ -43,27 +50,23 @@ class ColorChatGame:
         """Get the game's system prompt"""
         return {
             "role": "system",
-            "content": """You are an agent in a 10x10 grid world where you can communicate and move.
-Each turn you can perform multiple actions. Start each action with the command name:
+            "content": """Commands available each turn:
+MOVE: UP/DOWN/LEFT/RIGHT     # You can move multiple times
+SPEAK: message              # Send one message per turn
+COLOR: (R,G,B)             # Change color once per turn
 
-Available commands:
-MOVE: UP/DOWN/LEFT/RIGHT
-SPEAK: <enter message to speak to other squares around you>
-COLOR: (R,G,B)  # Where R,G,B are integers 0-255
+IMPORTANT: Use multiple commands each turn!
+Example multi-command turn:
+MOVE: direction
+MOVE: direction
+...
+SPEAK: message
+COLOR: (R,G,B)
 
-Example Valid Responses:
-MOVE: UP
-SPEAK: Hello everyone!
-COLOR: (255,0,0)
-
-Common Mistakes to Avoid:
-- MOVE must be UP, DOWN, LEFT, or RIGHT (case insensitive)
-- COLOR must be three numbers 0-255 in (R,G,B) format
-- Each command must be on its own line
-- Each line must start with MOVE:, SPEAK:, or COLOR:
-
-The system will tell you if any actions fail and why, so you can learn and improve.
-"""
+Format:
+- Start each command on a new line
+- Use exact command names: MOVE, SPEAK, COLOR
+- No empty lines between commands"""
         }
 
     def run(self, players: List['BaseLLMPlayer']) -> Dict:
@@ -98,7 +101,7 @@ The system will tell you if any actions fail and why, so you can learn and impro
                     "content": json.dumps({
                         "state": state,
                         "previous_actions": self.action_results[player.player_id],
-                        "message": f"You are at position ({state['agent']['position']['x']}, {state['agent']['position']['y']}). What would you like to do?"
+                        "message": f"You are at position ({state['position']['x']}, {state['position']['y']}). What would you like to do?"
                     })
                 }
                 
@@ -154,18 +157,12 @@ The system will tell you if any actions fail and why, so you can learn and impro
         recent_messages = self._get_recent_messages(agent.position)
         
         return {
-            "agent": {
-                "id": agent.id,
-                "position": {"x": agent.position.x, "y": agent.position.y},
-                "color": agent.color
-            },
-            "world": {
-                "size": self.config.size,
-                "visible_agents": visible_agents,
-                "recent_messages": recent_messages,
-                "communication_radius": self.config.communication_radius
-            },
-            "last_turn_results": self.action_results[agent_id]
+            "position": {"x": agent.position.x, "y": agent.position.y},
+            "color": agent.color,
+            "nearby": {
+                "squares": visible_agents,
+                "messages": recent_messages
+            }
         }
     
     def _get_recent_messages(self, position: Position) -> List[Dict[str, Any]]:
@@ -182,15 +179,35 @@ The system will tell you if any actions fail and why, so you can learn and impro
     def _parse_actions(self, response: str) -> List[str]:
         """Parse multiple actions from response"""
         actions = []
-        current_action = ""
+        seen_speak = False
+        seen_color = False
         
         # Split response into lines and process each line
         lines = response.strip().split('\n')
         for line in lines:
             line = line.strip()
+            
             # Skip empty lines and non-action lines
             if not line or not any(cmd in line for cmd in ["MOVE:", "SPEAK:", "COLOR:"]):
                 continue
+                
+            # Validate command format
+            if ":" not in line:
+                continue
+                
+            command, content = line.split(":", 1)
+            command = command.strip().upper()
+            
+            # Apply command limits
+            if command == "SPEAK":
+                if seen_speak:
+                    continue
+                seen_speak = True
+            elif command == "COLOR":
+                if seen_color:
+                    continue
+                seen_color = True
+            
             actions.append(line)
             
         return actions

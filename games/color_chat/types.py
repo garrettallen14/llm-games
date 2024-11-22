@@ -25,5 +25,16 @@ class Agent:
 @dataclass
 class WorldConfig:
     """World configuration"""
-    size: int = 10  # Fixed 10x10 grid
-    communication_radius: int = 2  # Can hear messages within 2 blocks
+    size: int = 50  # Default 50x50 grid
+    communication_radius: int = 5  # Default communication radius
+    
+    def __post_init__(self):
+        """Validate configuration"""
+        if self.size < 5:
+            raise ValueError("Grid size must be at least 5x5")
+        if self.size > 100:
+            raise ValueError("Grid size cannot exceed 100x100 for performance reasons")
+        if self.communication_radius < 1:
+            raise ValueError("Communication radius must be at least 1")
+        if self.communication_radius > self.size // 2:
+            raise ValueError(f"Communication radius cannot exceed half the grid size ({self.size // 2})")
