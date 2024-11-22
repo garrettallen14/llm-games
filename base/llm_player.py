@@ -97,7 +97,18 @@ class BaseLLMPlayer:
                 )
                 
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+                response_json = response.json()
+                
+                # Handle different API response formats
+                content = None
+                if "choices" in response_json:
+                    # OpenAI format
+                    content = response_json["choices"][0]["message"]["content"]
+                elif "candidates" in response_json:
+                    # Gemini format
+                    content = response_json["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    raise ValueError(f"Unknown API response format: {response_json.keys()}")
                 
                 assistant_message = {
                     "role": "assistant",
@@ -118,6 +129,7 @@ class BaseLLMPlayer:
             except Exception as e:
                 if attempt == self.config.max_retries - 1:
                     raise Exception(f"Unexpected error after {self.config.max_retries} attempts: {str(e)}")
+                print(f"Attempt {attempt + 1} failed with error: {str(e)}. Retrying in {self.config.retry_delay} seconds...")
                 time.sleep(self.config.retry_delay)
     
     def log_message(self, message: Dict[str, str]) -> None:
