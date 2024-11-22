@@ -1,0 +1,3 @@
+pandas
+numpy
+Pillow  # PIL fork
