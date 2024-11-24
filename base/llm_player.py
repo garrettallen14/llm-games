@@ -43,8 +43,7 @@ class BaseLLMPlayer:
         
     def initialize_with_prompt(self, system_prompt: Dict[str, str]) -> None:
         """Initialize the conversation with a system prompt"""
-        self.messages.append(system_prompt)
-        self.log_message(system_prompt)
+        self.add_message(system_prompt)
         
     def get_response(self, message: Dict[str, str], game_image: Optional[str] = None) -> str:
         """
@@ -60,8 +59,7 @@ class BaseLLMPlayer:
         Raises:
             Exception: If unable to get a valid response after max retries
         """
-        self.messages.append(message)
-        self.log_message(message)
+        self.add_message(message)
         
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -115,8 +113,7 @@ class BaseLLMPlayer:
                     "content": content
                 }
                 
-                self.messages.append(assistant_message)
-                self.log_message(assistant_message)
+                self.add_message(assistant_message)
                 
                 return content
                 
@@ -132,8 +129,9 @@ class BaseLLMPlayer:
                 print(f"Attempt {attempt + 1} failed with error: {str(e)}. Retrying in {self.config.retry_delay} seconds...")
                 time.sleep(self.config.retry_delay)
     
-    def log_message(self, message: Dict[str, str]) -> None:
-        """Log a message to the player's JSONL file"""
+    def add_message(self, message: Dict[str, str]) -> None:
+        """Add a message to the conversation history and log it"""
+        self.messages.append(message)
         if self.log_file:
             with open(self.log_file, 'a') as f:
                 entry = {

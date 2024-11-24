@@ -2,7 +2,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import re
 import numpy as np
-from numpy import npv, irr
+import numpy_financial as npf
 
 @dataclass
 class CellValue:
@@ -68,6 +68,9 @@ class UnderwritingModel:
         """Process a single command"""
         self.history.append(command)
         
+        # Strip any whitespace
+        command = command.strip()
+        
         # INSERT: value cell
         insert_match = re.match(r'^INSERT:\s*(-?\d*\.?\d*)\s+([A-M][0-9]{1,2})$', command)
         if insert_match:
@@ -75,9 +78,13 @@ class UnderwritingModel:
             return self.insert_value(float(value), cell)
         
         # FORMULA: cell expression
-        formula_match = re.match(r'^FORMULA:\s*([A-M][0-9]{1,2})\s+(.+)$', command)
+        formula_match = re.match(r'^FORMULA:\s*([A-M][0-9]{1,2})\s+=?\s*([A-M][0-9]{1,2}\s*[-+*/]\s*[0-9.]+|[0-9.]+\s*[-+*/]\s*[A-M][0-9]{1,2}|[A-M][0-9]{1,2}\s*[-+*/]\s*[A-M][0-9]{1,2})$', command)
         if formula_match:
             cell, expr = formula_match.groups()
+            # Clean up the expression
+            expr = expr.strip().lstrip('=').strip()
+            # Replace any spaces around operators
+            expr = re.sub(r'\s*([-+*/])\s*', r'\1', expr)
             return self.set_formula(cell, expr)
         
         # NPV: range rate_cell
@@ -102,13 +109,31 @@ class UnderwritingModel:
             return False, f"Invalid cell reference: {cell}"
         
         try:
-            # Basic formula evaluation - would need more sophisticated parsing
-            # for a real implementation
-            result = eval(expr)
-            self.cells[cell] = CellValue(value=result, formula=expr)
+            # Find all cell references in the expression (e.g., B1, C1)
+            cell_refs = re.findall(r'[A-M][0-9]{1,2}', expr)
+            
+            # Verify all referenced cells exist
+            for ref in cell_refs:
+                if ref not in self.cells:
+                    return False, f"Referenced cell {ref} does not exist"
+                if self.cells[ref].value == "":
+                    return False, f"Referenced cell {ref} is empty"
+            
+            # Replace cell references with their values
+            eval_expr = expr
+            for ref in cell_refs:
+                eval_expr = eval_expr.replace(ref, str(self.cells[ref].value))
+            
+            # Evaluate the formula
+            result = eval(eval_expr)
+            self.cells[cell] = CellValue(
+                value=float(result),
+                formula=expr,
+                dependencies=cell_refs
+            )
             return True, f"Set formula {expr} in {cell}, result: {result}"
-        except:
-            return False, f"Invalid formula: {expr}"
+        except Exception as e:
+            return False, f"Invalid formula: {expr} - {str(e)}"
     
     def calculate_npv(self, start: str, end: str, rate_cell: str) -> Tuple[bool, str]:
         """Calculate NPV of a range"""
@@ -118,7 +143,7 @@ class UnderwritingModel:
         try:
             rate = float(self.cells[rate_cell].value)
             values = self._get_range_values(start, end)
-            result = npv(rate, values)
+            result = npf.npv(rate, values)
             return True, f"NPV: {result}"
         except:
             return False, "Error calculating NPV"
@@ -240,7 +265,7 @@ class UnderwritingModel:
                 cash_flows.append(fcf)
             
             # Calculate NPV
-            value = npv(self.assumptions['discount_rate'], cash_flows)
+            value = npf.npv(self.assumptions['discount_rate'], cash_flows)
             
             # Check final value in M0
             final_value = float(self.cells['M0'].value)
