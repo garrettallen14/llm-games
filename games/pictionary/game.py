@@ -14,32 +14,33 @@ import random
 from base.llm_player import BaseLLMPlayer
 
 WORD_LIST = [
+    "animals"
     # Simple Shapes & Objects
-    "moon", "star", "heart", "house", "flag", "clock", "umbrella", "pizza", "snowman", "box",
+    # "moon", "star", "heart", "house", "flag", "clock", "umbrella", "pizza", "snowman", "box",
     
-    # Basic Animals
-    "cat", "dog", "fish", "bird", "rabbit", "penguin", "duck", "owl", "mouse", "snail",
+    # # Basic Animals
+    # "cat", "dog", "fish", "bird", "rabbit", "penguin", "duck", "owl", "mouse", "snail",
     
-    # Nature Elements
-    "tree", "flower", "sun", "mountain", "cloud", "rainbow", "beach", "wave", "leaf", "apple",
+    # # Nature Elements
+    # "tree", "flower", "sun", "mountain", "cloud", "rainbow", "beach", "wave", "leaf", "apple",
     
-    # Everyday Items
-    "book", "chair", "table", "cup", "hat", "glasses", "key", "lamp", "door", "bell",
+    # # Everyday Items
+    # "book", "chair", "table", "cup", "hat", "glasses", "key", "lamp", "door", "bell",
     
-    # Transportation
-    "car", "boat", "ship", "train", "bus", "bike", "plane", "rocket", "truck", "wagon",
+    # # Transportation
+    # "car", "boat", "ship", "train", "bus", "bike", "plane", "rocket", "truck", "wagon",
     
-    # Simple Buildings & Structures
-    "igloo", "tent", "bridge", "tower", "castle", "barn", "fence", "well", "ladder", "gate",
+    # # Simple Buildings & Structures
+    # "igloo", "tent", "bridge", "tower", "castle", "barn", "fence", "well", "ladder", "gate",
     
-    # Easy Weather & Sky
-    "rain", "snow", "storm", "wind", "star", "moon", "comet", "cloud", "sun", "rainbow",
+    # # Easy Weather & Sky
+    # "rain", "snow", "storm", "wind", "star", "moon", "comet", "cloud", "sun", "rainbow",
     
-    # Basic Food & Drinks
-    "ice cream", "cookie", "cake", "candy", "apple", "banana", "pizza", "egg", "pie", "cup",
+    # # Basic Food & Drinks
+    # "ice cream", "cookie", "cake", "candy", "apple", "banana", "pizza", "egg", "pie", "cup",
     
-    # Simple Tools
-    "hammer", "saw", "axe", "brush", "pen", "pencil", "ruler", "scissors", "shovel", "bucket"
+    # # Simple Tools
+    # "hammer", "saw", "axe", "brush", "pen", "pencil", "ruler", "scissors", "shovel", "bucket"
 ]
 
 @dataclass
@@ -149,6 +150,7 @@ class PictionaryGame:
     BOX_FILL_PATTERN = re.compile(r"BOX_FILL:\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)")
     CIRCLE_PATTERN = re.compile(r"CIRCLE:\s*\((\d+)\s*,\s*(\d+)\)\s*(\d+)\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)")
     LINE_PATTERN = re.compile(r"LINE:\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)")
+    TRIANGLE_PATTERN = re.compile(r"TRIANGLE:\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\)\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)")
     GUESS_PATTERN = re.compile(r"GUESS:\s*(.+)")
 
     def __init__(self, run_dir: Path, max_turns: int = 10, grid_size: int = 100) -> None:
@@ -196,6 +198,10 @@ Example: CIRCLE: (int,int) int (int,int,int)
 LINE: (x1,y1) (x2,y2) (r,g,b)
 Colors a line from (x1,y1) to (x2,y2)
 Example: LINE: (int,int) (int,int) (int,int,int)
+
+TRIANGLE: (x1,y1) (x2,y2) (x3,y3) (r,g,b)
+Colors a triangle with vertices at (x1,y1), (x2,y2), and (x3,y3)
+Example: TRIANGLE: (int,int) (int,int) (int,int) (int,int,int)
 
 When GUESSING, use:
 GUESS: your_guess_here
@@ -267,6 +273,17 @@ Technical Information:
     def validate_line(self, x1: int, y1: int, x2: int, y2: int, r: int, g: int, b: int) -> Tuple[bool, Optional[str]]:
         """Validate a line command."""
         for x, y in [(x1, y1), (x2, y2)]:
+            if not (0 <= x < self.config.grid_size and 0 <= y < self.config.grid_size):
+                return False, f"Position ({x},{y}) is out of bounds"
+        
+        for val, name in [(r, 'Red'), (g, 'Green'), (b, 'Blue')]:
+            if not (0 <= val <= 255):
+                return False, f"{name} value must be between 0 and 255"
+        return True, None
+
+    def validate_triangle(self, x1: int, y1: int, x2: int, y2: int, x3: int, y3: int, r: int, g: int, b: int) -> Tuple[bool, Optional[str]]:
+        """Validate a triangle command."""
+        for x, y in [(x1, y1), (x2, y2), (x3, y3)]:
             if not (0 <= x < self.config.grid_size and 0 <= y < self.config.grid_size):
                 return False, f"Position ({x},{y}) is out of bounds"
         
@@ -392,6 +409,24 @@ Technical Information:
                 error_message += "Invalid line format\n"
                 continue
 
+        for match in self.TRIANGLE_PATTERN.finditer(response):
+            try:
+                x1, y1, x2, y2, x3, y3, r, g, b = map(int, match.groups())
+                is_valid, error = self.validate_triangle(x1, y1, x2, y2, x3, y3, r, g, b)
+                
+                if not is_valid:
+                    has_error = True
+                    error_message += error + "\n"
+                    continue
+                
+                self.draw_triangle(x1, y1, x2, y2, x3, y3, r, g, b)
+                executed_actions.append(f"Triangle at ({x1},{y1}), ({x2},{y2}), and ({x3},{y3}) colored to ({r},{g},{b})")
+                    
+            except ValueError:
+                has_error = True
+                error_message += "Invalid triangle format\n"
+                continue
+
         for match in self.COLOR_PATTERN.finditer(response):
             try:
                 x, y, r, g, b = map(int, match.groups())
@@ -422,6 +457,46 @@ Technical Information:
             "message": error_message or "Invalid command format",
             "end_turn": False
         }
+
+    def draw_triangle(self, x1: int, y1: int, x2: int, y2: int, x3: int, y3: int, r: int, g: int, b: int) -> None:
+        """Draw a filled triangle on the grid using a scanline algorithm."""
+        # Create vertex arrays
+        vertices = np.array([[x1, y1], [x2, y2], [x3, y3]])
+        
+        # Get bounding box
+        min_x = max(0, int(vertices[:, 0].min()))
+        max_x = min(self.config.grid_size - 1, int(vertices[:, 0].max()))
+        min_y = max(0, int(vertices[:, 1].min()))
+        max_y = min(self.config.grid_size - 1, int(vertices[:, 1].max()))
+        
+        # Create meshgrid for vectorized point-in-triangle test
+        y, x = np.mgrid[min_y:max_y+1, min_x:max_x+1]
+        points = np.vstack((x.ravel(), y.ravel())).T
+        
+        # Compute barycentric coordinates
+        v0 = vertices[2] - vertices[0]
+        v1 = vertices[1] - vertices[0]
+        v2 = points - vertices[0]
+        
+        # Compute dot products
+        dot00 = np.dot(v0, v0)
+        dot01 = np.dot(v0, v1)
+        dot02 = np.dot(v0, v2.T)
+        dot11 = np.dot(v1, v1)
+        dot12 = np.dot(v1, v2.T)
+        
+        # Compute barycentric coordinates
+        inv_denom = 1 / (dot00 * dot11 - dot01 * dot01)
+        u = (dot11 * dot02 - dot01 * dot12) * inv_denom
+        v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+        
+        # Check if point is in triangle
+        inside = (u >= 0) & (v >= 0) & (u + v <= 1)
+        
+        # Color points inside triangle
+        points_inside = points[inside]
+        for px, py in points_inside:
+            self.state.color_pixel(int(px), int(py), r, g, b)
 
     def run(self, players: List[BaseLLMPlayer]) -> Dict[str, Any]:
         """Run the game with the LLM players."""
