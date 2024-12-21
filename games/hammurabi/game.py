@@ -1,9 +1,10 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from pathlib import Path
 from datetime import datetime
 import random
 import json
 from dataclasses import dataclass, field
+import re
 
 from base.llm_player import BaseLLMPlayer
 
@@ -35,15 +36,17 @@ class HammurabiConfig:
     bushels_to_plant: int = 1
     plague_chance: float = 0.15
     rat_chance: float = 0.40
+    seed: Optional[int] = None
 
 class HammurabiGame:
     """Implementation of the classic Hammurabi resource management game"""
     
-    def __init__(self, run_dir: Path, max_turns: int = 10):
+    def __init__(self, run_dir: Path, max_turns: int = 10, seed: Optional[int] = None):
         """Initialize the Hammurabi game"""
         self.config = HammurabiConfig(
             run_dir=run_dir,
-            max_turns=max_turns
+            max_turns=max_turns,
+            seed=seed  # Pass seed to config
         )
         self.state = HammurabiState()
         self.players: List[BaseLLMPlayer] = []
@@ -51,387 +54,338 @@ class HammurabiGame:
         # Game metadata
         self.start_time = datetime.now().isoformat()
         self.end_time = None
+        self.game_over = False
         
+        # Retry and move tracking
+        self.max_retries = 5
+        self.retry_count = 0
+        
+        # Set random seed if provided
+        if self.config.seed is not None:
+            random.seed(self.config.seed)
+
     def get_system_prompt(self) -> Dict[str, str]:
-        """Return the system prompt for LLM players"""
+        """Return a minimal system prompt for LLM players"""
         return {
             "role": "system",
-            "content": """You are playing Hammurabi, the classic resource management game. You are the ruler of ancient Samaria for a ten year term.
-            Your decisions each turn must be provided in this exact format:
-            MOVE: {"buy": X, "feed": Y, "plant": Z}
-            
-            Where:
-            - X is acres of land to buy (negative to sell)
-            - Y is bushels of grain to feed people
-            - Z is acres to plant
-            
-            Key rules:
-            - Each person needs 20 bushels of grain per year to survive
-            - Each person can farm at most 10 acres of land
-            - It takes 1 bushel of grain to plant an acre
-            - Land prices fluctuate yearly
-            - Random events like plague and rats may occur
-            
-            Before moving, please think carefully about resource allocation and then respond with a valid move in the exact format specified.
-            Your goal is to grow the population and wealth of your kingdom while minimizing starvation."""
+            "content": """Hammurabi Game: Rule Samaria for 10 years.
+
+Goal: Maximize your score.
+- Score = Bushels in storage + acres owned * 20 + population * 1000
+
+Core Rules:
+- Start: 100 people, 1000 acres, 2800 bushels
+- Each person needs 20 bushels/year
+- Max 10 acres per person
+- 1 bushel plants 1 acre
+- If your population goes to 0, you lose the game
+
+Yearly Randomness:
+- Harvest: 1-8 bushels/acre
+- 15% plague: Halve population
+- 40% rats: Halve stored bushels
+- Immigration: 0-10 people if no starvation
+
+You may think and plan before submitting your move.
+You must submit your final move in the exact following format:
+
+BUY: (+-integer)
+FEED: (integer)
+PLANT: (integer)
+
+The integers must be placed within parentheses in the exact format.
+"""
         }
-        
+
     def get_current_state(self, player_id: Optional[int] = None) -> str:
-        """Get the current game state"""
-        state = (
-            f"O great Hammurabi!\n"
-            f"You are in year {self.state.year} of your ten year rule.\n"
-            f"In the previous year {self.state.starved} people starved to death.\n"
-            f"In the previous year {self.state.immigrants} people entered the kingdom.\n"
-            f"The population is now {self.state.population}.\n"
-            f"We harvested {self.state.harvest} bushels at {self.state.bushels_per_acre} bushels per acre.\n"
-            f"Rats destroyed {self.state.rats_ate} bushels, leaving {self.state.bushels_in_storage} bushels in storage.\n"
-            f"The city owns {self.state.acres_owned} acres of land.\n"
-            f"Land is currently worth {self.state.cost_per_acre} bushels per acre.\n"
-            f"There were {self.state.plague_deaths} deaths from the plague.\n\n"
-        )
+        """Get the minimal current game state"""
+        return f"""Year {self.state.year}/10
+Population: {self.state.population} ({self.state.starved} starved, {self.state.immigrants} arrived)
+Harvest: {self.state.harvest} bushels ({self.state.bushels_per_acre}/acre)
+Storage: {self.state.bushels_in_storage} bushels (rats ate {self.state.rats_ate})
+Land: {self.state.acres_owned} acres at {self.state.cost_per_acre} bushels/acre
+Plague deaths: {self.state.plague_deaths}
+
+Valid moves:
+Buy/Sell: {-self.state.acres_owned} to {self.state.bushels_in_storage // self.state.cost_per_acre}
+Feed: 0 to {self.state.bushels_in_storage}
+Plant: 0 to {min(self.state.acres_owned, self.state.population * 10, self.state.bushels_in_storage)}"""
+
+    @staticmethod
+    def extract_integer(key: str, response: str) -> int:
+        """
+        Extract the last integer found in parentheses after the given key.
+        Example: If key is "BUY" and response contains "BUY: (-5)", returns -5
         
-        # Add valid move ranges
-        max_buy = self.state.bushels_in_storage // self.state.cost_per_acre
-        max_sell = self.state.acres_owned
-        max_feed = self.state.bushels_in_storage
-        max_plant = min(
-            self.state.acres_owned,
-            self.state.population * self.config.acres_per_person,
-            self.state.bushels_in_storage
-        )
+        Args:
+            key: String to search for (e.g., "BUY", "FEED", "PLANT")
+            response: Full text response to search in
         
-        state += (
-            f"Valid moves:\n"
-            f"Buy/Sell land: {-max_sell} to {max_buy} acres\n"
-            f"Feed people: 0 to {max_feed} bushels\n"
-            f"Plant crops: 0 to {max_plant} acres\n"
-            f"Please think carefully about resource allocation and respond with a valid move in the exact format specified.\n"
-        )
+        Returns:
+            Integer value found after the key, or 0 if no match found
+        """
+        # Look for pattern: key followed by ":" then an integer in parentheses
+        pattern = f"{key}:\s*\((-?\d+)\)"
+        matches = re.findall(pattern, response)
         
-        return state
-        
+        # Return last match if found, otherwise 0
+        return int(matches[-1]) if matches else None
+
     def validate_move(self, move: Dict) -> tuple[bool, List[str]]:
-        """Validate a move and return (is_valid, error_messages)"""
+        """Validate a move based on game rules"""
         errors = []
+
+        # BUYING LAND:
+        if move["buy"] > 0:
+            # You must have enough grain to pay for land purchases (land cost × acres)
+            if self.state.bushels_in_storage < self.state.cost_per_acre * move["buy"]:
+                errors.append(f"You must have enough grain to pay for land purchases (land cost × acres)")
+
+        # SELLING LAND:
+        if move["buy"] < 0:
+            # Cannot sell more land than you own
+            if move["buy"] < -self.state.acres_owned:
+                errors.append(f"Cannot sell more land than you own")
+
+        # FEEDING:
+        # Feed cannot be a negative number
+        if move["feed"] < 0:
+            errors.append(f"Feed cannot be a negative number")
+
+        # Cannot feed with more than the grain currently in storage
+        if move["feed"] > self.state.bushels_in_storage:
+            errors.append(f"Cannot feed with more than the grain currently in storage")
         
-        # Check move format
-        required_keys = ["buy", "feed", "plant"]
-        if not all(key in move for key in required_keys):
-            errors.append(f"Move must contain all required keys: {required_keys}")
-            return False, errors
-            
-        # Calculate costs
-        land_cost = move["buy"] * self.state.cost_per_acre
-        feed_cost = move["feed"]
-        plant_cost = move["plant"]
-        total_cost = land_cost + feed_cost + plant_cost
-        
-        # Check if we have enough bushels
-        if total_cost > self.state.bushels_in_storage:
-            errors.append(
-                f"Not enough bushels in storage. Required: {total_cost}, Available: {self.state.bushels_in_storage}\n"
-                f"Breakdown:\n"
-                f"- Land cost: {land_cost} ({move['buy']} acres at {self.state.cost_per_acre} bushels/acre)\n"
-                f"- Feeding cost: {feed_cost} bushels\n"
-                f"- Planting cost: {plant_cost} bushels"
-            )
-        
-        # Check land constraints
-        min_acres = -self.state.acres_owned
-        max_acres = self.state.bushels_in_storage // self.state.cost_per_acre
-        if not (min_acres <= move["buy"] <= max_acres):
-            errors.append(f"Invalid land purchase. Must be between {min_acres} and {max_acres} acres")
-        
-        # Check planting constraints
-        max_plantable = min(
-            self.state.acres_owned + move["buy"],  # Can't plant more acres than we own
-            self.state.population * self.config.acres_per_person,  # Each person can farm 10 acres
-            self.state.bushels_in_storage - land_cost - feed_cost  # Must have enough grain left to plant
-        )
-        if not (0 <= move["plant"] <= max_plantable):
-            errors.append(f"Invalid planting amount. Must be between 0 and {max_plantable} acres")
-        
-        # Check feeding constraints
-        if not (0 <= move["feed"] <= self.state.bushels_in_storage - land_cost):
-            errors.append(
-                f"Invalid feeding amount. Must be between 0 and {self.state.bushels_in_storage - land_cost} bushels"
-            )
-        
+        # PLANTING:
+        # Plant cannot be a negative number
+        if move["plant"] < 0:
+            errors.append(f"Plant cannot be a negative number")
+
+        if move["plant"] > 0:
+
+            # Cannot plant more acres than you own
+            if move["plant"] > self.state.acres_owned:
+                errors.append(f"Cannot plant more acres than you own")
+
+            # Cannot plant more than (population * 10) acres
+            if move["plant"] > self.state.acres_owned:
+                errors.append(f"Cannot plant more acres than you own")
+
+            # Need 1 bushel of grain per acre planted
+            if move["plant"] > self.state.bushels_in_storage:
+                errors.append(f"Need 1 bushel of grain per acre planted")
+
+            # Cannot use more grain than you have remaining after feeding
+            if move["plant"] > self.state.bushels_in_storage - move["feed"]:
+                errors.append(f"Cannot use more grain than you have remaining after feeding")
+
         return len(errors) == 0, errors
 
     def apply_move(self, move: Dict):
         """Apply a validated move to update the game state"""
-        # Store the move for history
-        self.state.move_history.append({
-            "year": self.state.year,
-            "move": move.copy(),
-            "result": {}
-        })
-        
-        # Apply the move
+        # print(f"\n[MOVE] Processing move: buy={move['buy']}, feed={move['feed']}, plant={move['plant']}")
+
+        # Store initial values for calculations
+        initial_population = self.state.population
+        initial_storage = self.state.bushels_in_storage
+        initial_acres = self.state.acres_owned
+
+        # BUY/SELL LAND:
         self.state.acres_owned += move["buy"]
-        self.state.bushels_in_storage -= (
-            move["buy"] * self.state.cost_per_acre +  # Land cost
-            move["feed"] +  # Feeding cost
-            move["plant"]  # Planting cost
-        )
-        
-        # Calculate starvation
-        bushels_needed = self.state.population * self.config.bushels_per_person
-        self.state.starved = (
-            self.state.population 
-            if move["feed"] == 0
-            else max(0, (bushels_needed - move["feed"]) // self.config.bushels_per_person)
-        )
+        self.state.bushels_in_storage -= move["buy"] * self.state.cost_per_acre
+
+        # FEED PEOPLE:
+        number_fed = move["feed"] // self.config.bushels_per_person
+        self.state.starved = self.state.population - number_fed
         self.state.population -= self.state.starved
+
+        # CALCULATE RANDOM EVENTS
         
-        # Calculate harvest
-        acres_planted = min(
-            move["plant"],
-            self.state.acres_owned,
-            self.state.population * self.config.acres_per_person
-        )
-        self.state.bushels_per_acre = random.randint(1, 8)
-        self.state.harvest = acres_planted * self.state.bushels_per_acre
-        self.state.bushels_in_storage += self.state.harvest
-        
-        # Random events
-        if random.random() < self.config.plague_chance:  # 15% chance of plague
-            self.state.plague_deaths = self.state.population // 2
-            self.state.population -= self.state.plague_deaths
-        else:
-            self.state.plague_deaths = 0
-            
-        # Rats
-        if random.random() < self.config.rat_chance:  # 40% chance of rats
-            self.state.rats_ate = self.state.bushels_in_storage // 2
-            self.state.bushels_in_storage -= self.state.rats_ate
-        else:
-            self.state.rats_ate = 0
-            
-        # Immigration
+        # Calculate immigration
+        potential_immigrants = random.randint(0, 10)
         if self.state.starved == 0:
-            self.state.immigrants = random.randint(0, 10)
+            self.state.immigrants = potential_immigrants
             self.state.population += self.state.immigrants
         else:
             self.state.immigrants = 0
-            
-        # Update land price for next turn
+
+        # Calculate plague and rats
+        self.state.plague_deaths = 0
+        self.state.rats_ate = 0
+
+        plague_roll = random.random()
+        if plague_roll < self.config.plague_chance:
+            self.state.plague_deaths = self.state.population // 2
+            self.state.population -= self.state.plague_deaths
+        
+        rat_roll = random.random()
+        if rat_roll < self.config.rat_chance:
+            self.state.rats_ate = self.state.bushels_in_storage // 2
+            self.state.bushels_in_storage -= self.state.rats_ate
+
+        # CALCULATE HARVEST
+        self.state.bushels_per_acre = random.randint(1,8)
+        self.state.harvest = move["plant"] * self.state.bushels_per_acre
+        self.state.bushels_in_storage += self.state.harvest
+
+        # UPDATE LAND PRICE
         self.state.cost_per_acre = random.randint(
             self.config.min_cost_per_acre,
             self.config.max_cost_per_acre
         )
-        self.state.year += 1
         
-        # Update move history with results
-        self.state.move_history[-1]["result"] = {
-            "starved": self.state.starved,
-            "immigrants": self.state.immigrants,
-            "population": self.state.population,
-            "harvest": self.state.harvest,
-            "rats_ate": self.state.rats_ate,
-            "plague_deaths": self.state.plague_deaths,
-            "bushels": self.state.bushels_in_storage,
-            "acres": self.state.acres_owned
-        }
+        # Record move in history with all required fields
+        self.state.move_history.append({
+            "year": self.state.year,
+            "move": move.copy(),
+            "result": {
+                "starved": self.state.starved,
+                "immigrants": self.state.immigrants,
+                "plague_deaths": self.state.plague_deaths,
+                "rats_ate": self.state.rats_ate,
+                "harvest": self.state.harvest,
+                "bushels_per_acre": self.state.bushels_per_acre,
+                "population": self.state.population,
+                "bushels": self.state.bushels_in_storage,
+                "acres": self.state.acres_owned
+            }
+        })
+        
+        # Increment year after recording history
+        self.state.year += 1
 
     def attempt_move(self, response: str, player_id: int) -> Dict:
         """Process a move attempt and return the outcome"""
         try:
-            # Extract move from response
-            move_start = response.find('{')
-            move_end = response.find('}') + 1
-            if move_start == -1 or move_end == -1:
-                error_msg = (
-                    "Invalid move format. Your response must contain 'MOVE: ' followed by a JSON object.\n"
-                    "Example: MOVE: {\"buy\": int, \"feed\": int, \"plant\": int}"
-                )
-                self._send_error_feedback(player_id, error_msg)
-                return {
-                    "valid": False,
-                    "message": error_msg,
-                    "end_turn": False
-                }
+            # Extract move components
+            move = {
+                "buy": self.extract_integer("BUY", response),
+                "feed": self.extract_integer("FEED", response),
+                "plant": self.extract_integer("PLANT", response),
+            }
             
-            try:
-                move_str = response[move_start:move_end]
-                move = json.loads(move_str)
-            except json.JSONDecodeError:
-                error_msg = (
-                    "Invalid JSON format. Your move must be a valid JSON object.\n"
-                    "Example: {\"buy\": int, \"feed\": int, \"plant\": int}"
-                )
-                self._send_error_feedback(player_id, error_msg)
+            # Debug print for extracted move
+            print(f"[DEBUG] Extracted move: {move}")
+            
+            # Check for missing or invalid values
+            if None in move.values():
+                self.retry_count += 1
+                print(f"[DEBUG] Invalid move format. Retry count: {self.retry_count}")
                 return {
                     "valid": False,
-                    "message": error_msg,
-                    "end_turn": False
+                    "message": "Invalid move format! Each command must include a number in parentheses.\nThe numbers must be placed within parentheses in the exact format.",
+                    "status": "continue",
+                    "reason": "invalid_format"
                 }
             
             # Validate move
             is_valid, errors = self.validate_move(move)
             if not is_valid:
-                error_msg = "Invalid move!\n" + "\n".join(f"- {err}" for err in errors)
-                self._send_error_feedback(player_id, error_msg)
+                print(f"[DEBUG] Move validation failed. Errors: {errors}")
                 return {
                     "valid": False,
-                    "message": error_msg,
-                    "end_turn": False
+                    "message": str(errors),
+                    "status": "continue",
+                    "reason": "invalid_move"
                 }
             
-            # Only apply move if it's valid
+            # Apply move if it's valid
             self.apply_move(move)
             
             # Check game end conditions
-            game_over = self.state.year > self.config.max_turns or self.state.population <= 0
+            game_over = self.state.year >= self.config.max_turns or self.state.population <= 0
             if game_over:
                 self.end_time = datetime.now().isoformat()
+                self.game_over = True
+                print("[DEBUG] Game over conditions met")
             
             return {
                 "valid": True,
                 "message": f"Move accepted.\n\n{self.get_current_state(player_id)}",
-                "end_turn": True,
-                "end_game": game_over,
-                "skip_inference": False  # Allow LLM to learn from mistakes
+                "status": "game_over" if game_over else "continue",
+                "reason": "game_complete" if game_over else None
             }
             
         except Exception as e:
             error_msg = f"Unexpected error processing move: {str(e)}"
-            self._send_error_feedback(player_id, error_msg)
+            print(f"[DEBUG] Exception in attempt_move: {error_msg}")
             return {
                 "valid": False,
                 "message": error_msg,
-                "end_turn": False
+                "status": "continue",
+                "reason": "error"
             }
-    
-    def _send_error_feedback(self, player_id: int, error_msg: str) -> None:
-        """Send error feedback to the player as a system message"""
-        feedback = (
-            f"Your last move was invalid. Please try again.\n\n"
-            f"Error details:\n{error_msg}\n\n"
-            f"Current state:\n{self.get_current_state(player_id)}\n\n"
-            f"Remember:\n"
-            f"1. Each person needs {self.config.bushels_per_person} bushels to survive\n"
-            f"2. Each person can farm {self.config.acres_per_person} acres\n"
-            f"3. It takes {self.config.bushels_to_plant} bushel to plant an acre\n"
-            f"4. Current land price: {self.state.cost_per_acre} bushels per acre"
-        )
-        
-        # Add message to player's conversation
-        players = self.get_players()
-        if players and 0 <= player_id - 1 < len(players):
-            players[player_id - 1].add_message({
-                "role": "system",
-                "content": feedback
-            })
-            
+
     def run(self, players: List[BaseLLMPlayer]) -> Dict:
         """Run the game with the provided players"""
         if not players:
             return {"status": "error", "message": "No players provided"}
             
         self.players = players
-        current_player = players[0]  # Single player game
-        print(f"\n Starting Hammurabi's reign... (Year {self.state.year} of {self.config.max_turns})\n")
+        current_player = players[0]
         
-        while self.state.year <= self.config.max_turns and self.state.population > 0:
+        while self.state.year < self.config.max_turns + 1 and self.state.population > 0 and not self.game_over:
             try:
                 print(f"\n Year {self.state.year} of {self.config.max_turns}")
                 print("=" * 50)
                 
-                # Keep trying until we get a valid move
-                valid_move = False
-                retry_count = 0
-                max_retries = 5
+                # Reset retry count for this turn
+                self.retry_count = 0
                 
                 # Get initial game state once
                 state_message = {
                     "role": "user",
                     "content": self.get_current_state(1)  # Always player 1
                 }
-                
                 # Get first response
                 response = current_player.get_response(state_message)
                 
-                while not valid_move and retry_count < max_retries:
+                while self.retry_count < self.max_retries:
                     outcome = self.attempt_move(response, 1)
                     
                     if not outcome["valid"]:
-                        print(f" Invalid move: {outcome['message']}")
-                        retry_count += 1
-                        if retry_count >= max_retries:
+                        self.retry_count += 1
+                        
+                        if self.retry_count >= self.max_retries:
+                            print("[DEBUG] Max retries exceeded")
                             return {
                                 "status": "game_over",
                                 "reason": "failed_to_move",
                                 "score": 0,
                                 "final_year": self.state.year,
                                 "history": self.state.move_history,
-                                "summary": "Your reign has ended - failed to make a valid move after 5 attempts!"
+                                "summary": "Your reign has ended - failed to make a valid move after 5 attempts!",
+                                "seed": self.config.seed
                             }
                         
                         # Only send the error message for retry attempts
                         error_message = {
                             "role": "user", 
-                            "content": f"Error: {outcome['message']}\nPlease try again with a valid move."
+                            "content": f"{outcome['message']}\n\nPlease try again with a valid move to continue playing the game. Attempt {self.retry_count + 1} of {self.max_retries}"
                         }
                         response = current_player.get_response(error_message)
                         continue
                     
-                    valid_move = True
-                    
-                    # Extract and show the move details
-                    move_start = response.find('{')
-                    move_end = response.find('}') + 1
-                    if move_start != -1 and move_end != -1:
-                        try:
-                            move = json.loads(response[move_start:move_end])
-                            print("\n Resource Allocation:")
-                            print(f" Land: {'Bought' if move['buy'] > 0 else 'Sold'} {abs(move['buy'])} acres "
-                                  f"({move['buy'] * self.state.cost_per_acre} bushels)")
-                            print(f" Food: {move['feed']} bushels "
-                                  f"(can feed {move['feed'] // 20} people)")
-                            print(f" Planting: {move['plant']} acres "
-                                  f"({move['plant']} bushels)")
-                            total_cost = (move['buy'] * self.state.cost_per_acre + 
-                                        move['feed'] + 
-                                        move['plant'])
-                            print(f" Total cost: {total_cost} bushels")
-                            print(f" Remaining in storage: {self.state.bushels_in_storage - total_cost} bushels\n")
-                        except:
-                            pass
-                    
-                    # Print year summary after valid move
-                    if self.state.year > 1:  # Don't show summary for first year
-                        print(f"\n Year {self.state.year} Summary:")
-                        print(f" Population: {self.state.population} "
-                              f"({'↑' + str(self.state.immigrants) if self.state.immigrants > 0 else '↓' + str(self.state.starved) if self.state.starved > 0 else '→'})")
-                        print(f" Harvest: {self.state.harvest} bushels "
-                              f"({self.state.bushels_per_acre} per acre)")
-                        print(f" Rats ate: {self.state.rats_ate} bushels")
-                        print(f"  Plague deaths: {self.state.plague_deaths}")
-                        print(f" Treasury: {self.state.bushels_in_storage} bushels")
-                        print(f"  Land owned: {self.state.acres_owned} acres")
-                        
-                        # Calculate score consistently with final scoring
-                        current_score = (
-                            self.state.bushels_in_storage +
-                            (self.state.acres_owned * 20) +
-                            (self.state.population * 100)
-                        )
-                        print(f" Current score: {current_score:,}")
-                    
-                    if outcome["end_game"]:
+                    # Valid move was made
+                    if outcome["status"] == "game_over":
+                        print("[DEBUG] Game over after valid move")
                         return self.get_game_result()
-                
+                    
+                    # Break out of retry loop on valid move
+                    break
+
+                # Reset retry count on valid move
+                self.retry_count = 0
+
             except Exception as e:
-                print(f" Error during turn: {str(e)}")
+                print(f"[DEBUG] Error during turn: {str(e)}")
                 continue
                 
+        print("[DEBUG] Exited main game loop")
         return self.get_game_result()
-        
+
     def get_game_result(self) -> Dict:
-        """Get the final game result"""
+        """Get the final game result with comprehensive scoring"""
         if self.state.population <= 0:
             return {
                 "status": "game_over",
@@ -439,17 +393,40 @@ class HammurabiGame:
                 "score": 0,
                 "final_year": self.state.year,
                 "history": self.state.move_history,
-                "summary": "Your reign has ended in disaster - the entire population has perished!"
+                "summary": "Your reign has ended in disaster - the entire population has perished!",
+                "seed": self.config.seed,
+                "metrics": {
+                    "population": 0,
+                    "acres": self.state.acres_owned,
+                    "bushels": self.state.bushels_in_storage
+                }
             }
             
+        # Calculate final score with detailed components
+        final_metrics = {
+            "bushels_score": self.state.bushels_in_storage,
+            "land_score": self.state.acres_owned * 20,
+            "population_score": self.state.population * 100,
+            "population_growth": self.state.population - 100,  # Starting population
+            "acres_gained": self.state.acres_owned - 1000,  # Starting acres
+            "total_immigrants": sum(
+                move.get('result', {}).get('immigrants', 0) 
+                for move in self.state.move_history
+            ),
+            "total_starved": sum(
+                move.get('result', {}).get('starved', 0) 
+                for move in self.state.move_history
+            )
+        }
+        
         # Calculate final score
         final_score = (
-            self.state.bushels_in_storage +
-            (self.state.acres_owned * 20) +
-            (self.state.population * 100)
+            final_metrics["bushels_score"] +
+            final_metrics["land_score"] +
+            final_metrics["population_score"]
         )
         
-        # Calculate performance rating
+        # Determine performance rating
         if final_score < 5000:
             rating = "Terrible"
             message = "Your incompetent leadership will be remembered with scorn."
@@ -467,20 +444,24 @@ class HammurabiGame:
             message = "Your wise leadership has made Samaria flourish!"
         else:
             rating = "Legendary"
-            message = "You will be remembered as one of history's greatest rulers!"
+            message = "You will be remembered as one of historys greatest rulers!"
         
         return {
             "status": "complete",
-            "years_ruled": self.state.year - 1,
-            "final_population": self.state.population,
-            "final_acres": self.state.acres_owned,
-            "final_bushels": self.state.bushels_in_storage,
+            "years_ruled": self.state.year,
             "score": final_score,
             "rating": rating,
             "message": message,
+            "seed": self.config.seed,
+            "metrics": final_metrics,
+            "final_state": {
+                "population": self.state.population,
+                "acres": self.state.acres_owned,
+                "bushels": self.state.bushels_in_storage
+            },
             "history": self.state.move_history
         }
-        
+
     def get_final_position(self) -> str:
         """Get string representation of final game state"""
         result = self.get_game_result()
@@ -499,9 +480,9 @@ class HammurabiGame:
             " Final Results of Your Reign\n"
             "═══════════════════════════════\n"
             f"Years Ruled: {result['years_ruled']}\n"
-            f"Final Population: {result['final_population']:,} citizens\n"
-            f"Land Owned: {result['final_acres']:,} acres\n"
-            f"Treasury: {result['final_bushels']:,} bushels\n"
+            f"Final Population: {result['final_state']['population']:,} citizens\n"
+            f"Land Owned: {result['final_state']['acres']:,} acres\n"
+            f"Treasury: {result['final_state']['bushels']:,} bushels\n"
             f"Final Score: {result['score']:,}\n"
             f"Rating: {result['rating']}\n"
             f"\n{result['message']}\n\n"

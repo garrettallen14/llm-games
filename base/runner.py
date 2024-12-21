@@ -23,6 +23,7 @@ class RunnerConfig:
     max_turns: int = 100
     games_path: Path = Path("games")
     logs_path: Path = Path("logs")
+    seed: Optional[int] = None
 
 class GameRunner:
     """Handles loading and running games with LLM players"""
@@ -120,7 +121,16 @@ class GameRunner:
         try:
             # Load game class and create instance
             game_class = self.load_game_module()
-            game = game_class(run_dir=self.run_dir, max_turns=self.config.max_turns)
+            
+            # Pass seed if provided
+            game_kwargs = {
+                'run_dir': self.run_dir, 
+                'max_turns': self.config.max_turns
+            }
+            if self.config.seed is not None:
+                game_kwargs['seed'] = self.config.seed
+            
+            game = game_class(**game_kwargs)
             
             # Create players
             players = self.create_players()
@@ -159,12 +169,19 @@ def parse_args():
         default=100,
         help='Maximum number of turns before game ends'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Seed for random number generation'
+    )
     
     args = parser.parse_args()
     return RunnerConfig(
         models=[m.strip() for m in args.models.split(',')],
         game_id=args.game_id,
-        max_turns=args.max_turns
+        max_turns=args.max_turns,
+        seed=args.seed
     )
 
 if __name__ == '__main__':

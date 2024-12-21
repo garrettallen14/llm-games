@@ -6,31 +6,55 @@ import os
 from datetime import datetime
 from typing import List, Dict
 import time
+import random
 
 # Models to benchmark
 MODELS = [
-    "openai/o1-preview",
-    "openai/o1-mini"
-    # "anthropic/claude-3.5-haiku",
-    # "anthropic/claude-3.5-sonnet", 
-    # "openai/gpt-4o-2024-11-20",
-    # "meta-llama/llama-3.1-8b-instruct",
-    # "cohere/command-r-08-2024",
-    # "mistralai/mistral-7b-instruct",
+    # "openai/o1-preview",
+    "meta-llama/llama-3.3-70b-instruct",
+    "anthropic/claude-3.5-sonnet",
     # "google/gemini-pro-1.5",
-    # "google/gemini-flash-1.5-8b",
-    # "meta-llama/llama-3.2-3b-instruct",
-    # "meta-llama/llama-3.1-405b-instruct",
+    # "qwen/qwq-32b-preview", 
+    # "openai/o1-mini", 
+    # "anthropic/claude-3.5-haiku",
     # "openai/gpt-4o-mini",
+    # "openai/gpt-4o-2024-11-20",
+    # "google/gemini-flash-1.5-8b",
+    # "meta-llama/llama-3.1-8b-instruct",
+    # "mistralai/mistral-7b-instruct",
+
+    # "meta-llama/llama-3.2-3b-instruct",
+    # "amazon/nova-lite-v1",
+    # "amazon/nova-micro-v1",
+    # "amazon/nova-pro-v1",
+    # "cohere/command-r-08-2024",
+    # "meta-llama/llama-3.1-405b-instruct",
     # "nvidia/llama-3.1-nemotron-70b-instruct",
 ]
 
 # Number of runs per model
 RUNS_PER_MODEL = 10
 
-def run_game(model: str, run_number: int) -> Dict:
-    """Run a single game of Hammurabi with the specified model"""
+# Generate a consistent set of 10 seeds for all models
+def generate_global_seeds() -> List[int]:
+    """Generate a consistent set of 10 global seeds"""
+    # Use a fixed base seed for reproducibility
+    base_seed = 42  # Chosen arbitrarily but consistently
+    random.seed(base_seed)
+    
+    # Generate 10 unique, deterministic seeds
+    seeds = [
+        random.randint(0, 2**32 - 1)
+        for _ in range(RUNS_PER_MODEL)
+    ]
+    
+    return seeds
+
+def run_game(model: str, run_number: int, seed: int) -> Dict:
+    """Run a single game of Hammurabi with the specified model and seed"""
     try:
+        print(f"Running {model} (Run {run_number}) with seed {seed}")
+
         # Capture both stdout and stderr while showing live output
         process = subprocess.Popen(
             [
@@ -42,7 +66,9 @@ def run_game(model: str, run_number: int) -> Dict:
                 "--models",
                 model,
                 "--max_turns",
-                "10"
+                "10",
+                "--seed",  # Add seed argument
+                str(seed)  # Convert seed to string
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -59,18 +85,18 @@ def run_game(model: str, run_number: int) -> Dict:
             if line:
                 print(line, end='', flush=True)  # Print immediately
                 output_lines.append(line)
-            
+
             # Check if process has finished
             if process.poll() is not None:
                 break
-        
+
         # Get any remaining output and errors
         stdout, stderr = process.communicate()
         if stdout:
             print(stdout, end='', flush=True)
             output_lines.extend(stdout.splitlines())
-        
-        # Check for game result in collected output
+
+        # Find the game result in the output
         for line in reversed(output_lines):
             if "Game complete! Result:" in line:
                 # Find the JSON part after "Game complete! Result:"
@@ -82,7 +108,7 @@ def run_game(model: str, run_number: int) -> Dict:
                 game_result["run_number"] = run_number
                 game_result["timestamp"] = datetime.now().isoformat()
                 return game_result
-                
+
         # If we get here, we couldn't find a valid result
         return {
             "status": "error",
@@ -92,7 +118,7 @@ def run_game(model: str, run_number: int) -> Dict:
             "error": "Could not find game result in output",
             "stderr": "\n".join(output_lines)
         }
-        
+
     except subprocess.CalledProcessError as e:
         return {
             "status": "error",
@@ -124,10 +150,15 @@ def main():
     # Create results directory if it doesn't exist
     os.makedirs("benchmark_results", exist_ok=True)
     
+    # Generate global seeds for all models
+    global_seeds = generate_global_seeds()
+    print("Global Seeds for this benchmark:", global_seeds)
+    
     # Create output file with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = f"benchmark_results/hammurabi_benchmark_{timestamp}.jsonl"
     
+    # Calculate total runs
     total_runs = len(MODELS) * RUNS_PER_MODEL
     current_run = 0
     
@@ -143,10 +174,12 @@ def main():
             print(f"\nTesting model: {model}")
             for run in range(RUNS_PER_MODEL):
                 current_run += 1
+                seed = global_seeds[run]
+                
                 print(f"\nRun {run + 1}/{RUNS_PER_MODEL} (Overall progress: {current_run}/{total_runs})")
                 
-                # Run the game
-                result = run_game(model, run + 1)
+                # Run the game with the specific seed
+                result = run_game(model, run + 1, seed)
                 
                 # Print error details if something went wrong
                 if result.get("status") == "error":

@@ -8,6 +8,7 @@ import time
 import os
 from datetime import datetime
 from dataclasses import dataclass
+import random
 
 @dataclass
 class PlayerConfig:
@@ -17,7 +18,9 @@ class PlayerConfig:
     run_dir: Path
     context_window: int = 2000000
     max_retries: int = 5
-    retry_delay: int = 1
+    base_delay: float = 1.0  # Base delay in seconds
+    max_delay: float = 32.0  # Maximum delay in seconds
+    jitter: float = 0.1  # Random jitter factor
     multimodal: bool = True
 
 class BaseLLMPlayer:
@@ -47,7 +50,7 @@ class BaseLLMPlayer:
         
     def get_response(self, message: Dict[str, str], game_image: Optional[str] = None) -> str:
         """
-        Get a response from the LLM model
+        Get a response from the LLM model with exponential backoff retry
         
         Args:
             message: The message to send to the model
@@ -91,7 +94,7 @@ class BaseLLMPlayer:
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
                     json=request_body,
-                    timeout=30
+                    timeout=3000000
                 )
                 
                 response.raise_for_status()
@@ -117,17 +120,21 @@ class BaseLLMPlayer:
                 
                 return content
                 
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, ValueError) as e:
+                # Calculate delay with exponential backoff and jitter
+                delay = min(
+                    self.config.base_delay * (2 ** attempt),  # Exponential growth
+                    self.config.max_delay  # Cap at max delay
+                )
+                # Add random jitter
+                jitter_range = delay * self.config.jitter
+                delay += random.uniform(-jitter_range, jitter_range)
+                
                 if attempt == self.config.max_retries - 1:
                     raise Exception(f"Failed to get response after {self.config.max_retries} attempts: {str(e)}")
-                print(f"Attempt {attempt + 1} failed. Retrying in {self.config.retry_delay} seconds...")
-                time.sleep(self.config.retry_delay)
-            
-            except Exception as e:
-                if attempt == self.config.max_retries - 1:
-                    raise Exception(f"Unexpected error after {self.config.max_retries} attempts: {str(e)}")
-                print(f"Attempt {attempt + 1} failed with error: {str(e)}. Retrying in {self.config.retry_delay} seconds...")
-                time.sleep(self.config.retry_delay)
+                
+                print(f"Attempt {attempt + 1} failed. Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
     
     def add_message(self, message: Dict[str, str]) -> None:
         """Add a message to the conversation history and log it"""
