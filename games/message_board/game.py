@@ -18,7 +18,7 @@ from enum import Enum, auto
 
 from base.llm_player import BaseLLMPlayer
 
-API_BASE_URL = "https://ai-boards.vercel.app/api"
+API_BASE_URL = "https://aiboards.org/api"
 
 @dataclass
 class BoardConfig:
@@ -121,6 +121,7 @@ class MessageBoardGame:
         self.player_keys = {}  # Store API keys per player
         self.player_posts = {}  # Track posts made by each player
         self.player_votes = {}  # Track votes made by each player as (post_id, vote_value) tuples
+        self.player_communities = {}  # Track communities created by each player
 
     def _log_api_call(self, method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None):
         """Log API call details"""
@@ -194,17 +195,22 @@ class MessageBoardGame:
         self.console.print(table)
 
     def _get_api_key(self, player_id: Optional[int] = None) -> str:
-        """Get or generate an API key for a player"""
         # If no player_id, generate a temporary key
         if player_id is None:
             return f"{self.config.api_key_prefix}{uuid.uuid4()}"
             
         # For actual players, ensure consistent key
         if player_id not in self.player_keys:
-            self.player_keys[player_id] = f"{self.config.api_key_prefix}{uuid.uuid4()}"
-            self.player_posts[player_id] = set()
-            self.player_votes[player_id] = set()
-            
+            # Register new API key with server
+            result = self._api_request("POST", "api-keys", player_id=None)  # Use None to avoid recursion
+            if result and 'apiKey' in result:
+                self.player_keys[player_id] = result['apiKey']
+                self.player_posts[player_id] = set()
+                self.player_votes[player_id] = set()
+            else:
+                # Fallback to local generation if API call fails
+                self.player_keys[player_id] = f"{self.config.api_key_prefix}{uuid.uuid4()}"
+                
         return self.player_keys[player_id]
 
     def _api_request(self, method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None, player_id: Optional[int] = None) -> Dict:
@@ -277,11 +283,22 @@ class MessageBoardGame:
 
     def create_community(self, name: str, description: str) -> Dict:
         """Create a new community"""
+        # Validate that the current player hasn't already created a community
+        if self.current_player_id in self.player_communities:
+            self._send_system_message("You have already created a community. Each player is limited to creating one community.", self.current_player)
+            return {}
+
         data = {
             "name": name,
             "description": description
         }
-        return self._api_request("POST", "communities", data=data)
+        result = self._api_request("POST", "communities", data=data)
+        
+        # If community creation was successful, track it
+        if result and 'id' in result and self.current_player_id is not None:
+            self.player_communities[self.current_player_id] = result['id']
+            
+        return result
 
     def get_posts(self, community_id: Optional[str] = None) -> List[Dict]:
         """Get posts, optionally filtered by community"""
@@ -339,29 +356,32 @@ class MessageBoardGame:
         return {
             "role": "system",
             "content": """
+You are a player on a message board. You must ONLY respond with EXACT commands from this list:
 
-Create Rules in the town hall
+HOME
+NEW COMMUNITY <name> | <description>
+READ COMMUNITY <id>
+READ POST <id>
+NEW POST <community_id> | <title> | <content>
+REPLY <post_id> | <content>
+VOTE <post_id> <up/down>
 
-propose changes to aiboards.org
+CRITICAL RULES:
+1. ONLY use the EXACT commands shown above. DO NOT add any extra text, explanations, or formatting
+2. Each player can create only ONE community during the game
+3. You cannot create another community once you've created one
+4. You can post and interact in any community
+5. Images are not supported
+6. You can ONLY SUBMIT ONE COMMAND per turn
 
-COMMAND REFERENCE (use exactly as shown):
+Your goal is to create posts, interact with others, and have fun!
 
-HOME     # Returns to main view
+Example valid commands:
+NEW COMMUNITY Community Title Here | Description here
+READ COMMUNITY int
+NEW POST int | Post Title | Post message
 
-READ COMMUNITY <id>  # Views a community's posts
-
-READ POST <id>   # Views a post and replies
-
-NEW POST <community_id> | <title> | <content>    # Creates new post
-
-REPLY <post_id> | <content>  # Replies to post
-
-VOTE <post_id> <up/down>     # Votes on post
-
-Respond with the exact command you would like to use, along with the content. Use only one command at a time please!
-Create Rules in the town hall
-
-propose changes to aiboards.org
+GOAL: Discuss AI safety. Be rational, and take a stance towards novel debate.
 """
         }
 
@@ -526,40 +546,68 @@ propose changes to aiboards.org
                     })
                     return result
 
-            elif command == "NEW" and parts[1].upper() == "POST":
-                if "|" not in response:
-                    self._send_system_message(ErrorType.INVALID_SEPARATOR.value, self.current_player)
-                    return {"valid": False, "message": ErrorType.INVALID_SEPARATOR.value}
-                
-                try:
-                    _, params = response.split(" POST ", 1)
-                    community_id, title, content = [p.strip() for p in params.split("|")]
-                except ValueError:
+            elif command == "NEW":
+                if len(parts) < 2:
                     self._send_system_message(ErrorType.MISSING_PARAMS.value, self.current_player)
                     return {"valid": False, "message": ErrorType.MISSING_PARAMS.value}
 
-                # Validate post parameters
-                valid, error = Validator.validate_post_params(title, content)
-                if not valid:
-                    self._send_system_message(error.value, self.current_player)
-                    return {"valid": False, "message": error.value}
+                if parts[1].upper() == "COMMUNITY":
+                    if "|" not in response:
+                        self._send_system_message(ErrorType.INVALID_SEPARATOR.value, self.current_player)
+                        return {"valid": False, "message": ErrorType.INVALID_SEPARATOR.value}
+                    
+                    try:
+                        _, params = response.split(" COMMUNITY ", 1)
+                        name, description = [p.strip() for p in params.split("|")]
+                    except ValueError:
+                        self._send_system_message(ErrorType.MISSING_PARAMS.value, self.current_player)
+                        return {"valid": False, "message": ErrorType.MISSING_PARAMS.value}
 
-                # Check community exists
-                community = self.get_community(community_id)
-                if not community:
-                    self._send_system_message(ErrorType.COMMUNITY_NOT_FOUND.value, self.current_player)
-                    return {"valid": False, "message": ErrorType.COMMUNITY_NOT_FOUND.value}
+                    community = self.create_community(name, description)
+                    if community:
+                        result.update({
+                            "valid": True,
+                            "message": f"Community '{name}' created successfully with ID: {community.get('id')}",
+                            "end_turn": True,
+                            "is_browse_action": False
+                        })
+                        return result
+                    return {"valid": False, "message": "Failed to create community"}
 
-                post = self.create_post(title, content, community_id)
-                if post:
-                    result.update({
-                        "valid": True,
-                        "message": "Post created successfully",
-                        "end_turn": True,
-                        "is_browse_action": False
-                    })
-                    return result
-                return {"valid": False, "message": "Failed to create post"}
+                elif parts[1].upper() == "POST":
+                    if "|" not in response:
+                        self._send_system_message(ErrorType.INVALID_SEPARATOR.value, self.current_player)
+                        return {"valid": False, "message": ErrorType.INVALID_SEPARATOR.value}
+                
+                    try:
+                        _, params = response.split(" POST ", 1)
+                        community_id, title, content = [p.strip() for p in params.split("|")]
+                    except ValueError:
+                        self._send_system_message(ErrorType.MISSING_PARAMS.value, self.current_player)
+                        return {"valid": False, "message": ErrorType.MISSING_PARAMS.value}
+
+                    # Validate post parameters
+                    valid, error = Validator.validate_post_params(title, content)
+                    if not valid:
+                        self._send_system_message(error.value, self.current_player)
+                        return {"valid": False, "message": error.value}
+
+                    # Check community exists
+                    community = self.get_community(community_id)
+                    if not community:
+                        self._send_system_message(ErrorType.COMMUNITY_NOT_FOUND.value, self.current_player)
+                        return {"valid": False, "message": ErrorType.COMMUNITY_NOT_FOUND.value}
+
+                    post = self.create_post(title, content, community_id)
+                    if post:
+                        result.update({
+                            "valid": True,
+                            "message": "Post created successfully",
+                            "end_turn": True,
+                            "is_browse_action": False
+                        })
+                        return result
+                    return {"valid": False, "message": "Failed to create post"}
 
             elif command == "REPLY":
                 if "|" not in response:

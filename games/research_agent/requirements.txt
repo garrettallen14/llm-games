@@ -1,0 +1,12 @@
+numpy<2
+matplotlib
+pandas
+scikit-learn
+seaborn
+requests
+nltk
+wordcloud
+PyPDF2
+beautifulsoup4
+html2text
+python-dotenv
